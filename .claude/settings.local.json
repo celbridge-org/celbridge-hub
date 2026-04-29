@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/bin/activate)",
+      "Bash(python manage.py test file_manager)",
+      "Bash(python manage.py runserver)",
+      "Bash(python manage.py runserver 8001)"
+    ]
+  }
+}
