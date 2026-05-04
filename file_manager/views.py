@@ -44,7 +44,7 @@ class FileRetrieveView(APIView):
         return FileResponse(uploaded_file.file)
 
 class FileDeleteView(APIView):
-    permission_classes = [AllowAny]  
+    permission_classes = [IsAuthenticated]
     
     def delete(self, request, pk):
         uploaded_file = get_object_or_404(UploadedFile, pk=pk)
