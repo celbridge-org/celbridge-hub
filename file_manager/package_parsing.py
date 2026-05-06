@@ -13,7 +13,7 @@ import zipfile
 from dataclasses import dataclass
 
 
-VALID_TYPES = ('mod', 'project', 'app')
+VALID_TYPES = ('mod', 'project', 'page')
 
 
 class PackageValidationError(Exception):
@@ -89,7 +89,7 @@ def parse_package_zip(zip_path_or_file) -> ParsedPackage:
         if type_ not in VALID_TYPES:
             raise PackageValidationError(
                 "invalid package - `[package] 'type'` property in `package.toml`"
-                ' file must be one of "mod", "project", or "app"'
+                ' file must be one of "mod", "project", or "page"'
             )
 
         history_bytes = _read_member(zf, 'history.md')

@@ -3,10 +3,10 @@ from django.contrib import admin
 from .models import (
     Author,
     Package,
+    PackageAlias,
     PackageType,
     PackageVersion,
     SiteConfiguration,
-    UploadedFile,
 )
 
 
@@ -17,11 +17,6 @@ class SiteConfigurationAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
-
-
-@admin.register(UploadedFile)
-class UploadedFileAdmin(admin.ModelAdmin):
-    list_display = ['file', 'file_size', 'uploaded_at']
 
 
 @admin.register(Author)
@@ -48,3 +43,10 @@ class PackageVersionAdmin(admin.ModelAdmin):
     list_filter = ['package__package_type']
     search_fields = ['package__name', 'author__name']
     readonly_fields = ['uploaded_at']
+
+
+@admin.register(PackageAlias)
+class PackageAliasAdmin(admin.ModelAdmin):
+    list_display = ['package', 'name', 'version', 'updated_at']
+    list_filter = ['package__package_type']
+    search_fields = ['package__name', 'name']

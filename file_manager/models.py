@@ -21,20 +21,6 @@ class SiteConfiguration(models.Model):
         return obj
 
 
-class UploadedFile(models.Model):
-    file = models.FileField(upload_to='uploads/%Y/%m/%d/')
-    uploaded_at = models.DateTimeField(auto_now_add=True)
-    file_size = models.BigIntegerField()
-
-    def save(self, *args, **kwargs):
-        if not self.file_size:
-            self.file_size = self.file.size
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return self.file.name
-
-
 class Author(models.Model):
     name = models.CharField(max_length=255, unique=True)
     user = models.ForeignKey(
@@ -113,3 +99,25 @@ class PackageVersion(models.Model):
 
     def render_uploaded_at(self):
         return self.uploaded_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class PackageAlias(models.Model):
+    package = models.ForeignKey(
+        Package,
+        on_delete=models.CASCADE,
+        related_name='aliases',
+    )
+    name = models.CharField(max_length=64)
+    version = models.ForeignKey(
+        PackageVersion,
+        on_delete=models.CASCADE,
+        related_name='aliases',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('package', 'name')
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.package.name}@{self.name} → v{self.version.version}'

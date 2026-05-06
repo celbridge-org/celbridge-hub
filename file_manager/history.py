@@ -25,7 +25,13 @@ from __future__ import annotations
 
 import re
 
-from .models import Package, PackageVersion
+from .models import Package, PackageAlias, PackageVersion
+
+
+_SNAPSHOT_BLOCKQUOTE = (
+    '> Authoritative copy lives on the server. '
+    'This file is a snapshot at publish time.'
+)
 
 
 _LEADING_HASH_RE = re.compile(r'^[ \t]*#+[ \t]?')
@@ -108,6 +114,19 @@ def _ancestor_section(
     return f'---\n\n{heading}\n\n{body}', versions[-1]
 
 
+def _render_aliases_table(package: Package) -> str:
+    aliases = list(
+        PackageAlias.objects
+        .filter(package=package)
+        .select_related('version')
+        .order_by('name')
+    )
+    lines = ['## Aliases', '', '| Name | Version |', '|---|---|']
+    for alias in aliases:
+        lines.append(f'| {alias.name} | {alias.version.version} |')
+    return '\n'.join(lines)
+
+
 def render_history(package: Package) -> str:
     """Return the full `HISTORY.md` text for a package, including any fork
     chain. Newest version first."""
@@ -118,7 +137,15 @@ def render_history(package: Package) -> str:
         .order_by('-version')
     )
 
-    parts = [f'# Package History: {package.name}', '', '## Versions']
+    parts = [
+        f'# Package History: {package.name}',
+        '',
+        _SNAPSHOT_BLOCKQUOTE,
+        '',
+        _render_aliases_table(package),
+        '',
+        '## Versions',
+    ]
     if versions:
         parts.append('')
         parts.append(_versions_block(versions))

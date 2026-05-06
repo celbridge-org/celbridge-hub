@@ -31,3 +31,10 @@ NOTE
 ```
 ALLOWED_HOSTS = ['127.0.0.1', 'localhost']
 ```
+
+## Matt notes:
+
+if wipe DB you'll need to:
+1. create a new superuser
+2. create new client user
+

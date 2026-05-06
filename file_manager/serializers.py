@@ -1,31 +1,6 @@
 from rest_framework import serializers
 
-from .models import (
-    Package,
-    PackageVersion,
-    SiteConfiguration,
-    UploadedFile,
-)
-
-
-class UploadedFileSerializer(serializers.ModelSerializer):
-    file_url = serializers.SerializerMethodField()
-
-    class Meta:
-        model = UploadedFile
-        fields = ['id', 'file', 'file_url', 'uploaded_at', 'file_size']
-        read_only_fields = ['id', 'uploaded_at', 'file_size', 'file_url']
-
-    def get_file_url(self, obj):
-        return obj.file.url
-
-    def validate_file(self, value):
-        max_size_mb = SiteConfiguration.get().max_file_size_mb
-        if value.size > max_size_mb * 1024 * 1024:
-            raise serializers.ValidationError(
-                f"File size must not exceed {max_size_mb} MB."
-            )
-        return value
+from .models import Package, PackageAlias, PackageVersion
 
 
 class PackageVersionSerializer(serializers.ModelSerializer):
@@ -62,12 +37,12 @@ class PackageVersionSerializer(serializers.ModelSerializer):
     def get_download_url(self, obj):
         if obj.is_tombstoned:
             return None
-        return f'/api/packages/{obj.package.name}/v{obj.version}/'
+        return f'/api/packages/{obj.package.name}/versions/{obj.version}/download'
 
     def get_public_url(self, obj):
         if obj.is_tombstoned:
             return None
-        if obj.package.package_type.name != 'app':
+        if obj.package.package_type.name != 'page':
             return None
         latest = obj.package.versions.order_by('-version').first()
         if latest and latest.id == obj.id:
@@ -84,6 +59,14 @@ class PackageVersionSerializer(serializers.ModelSerializer):
             'package': obj.forked_from.package.name,
             'version': obj.forked_from.version,
         }
+
+
+class PackageAliasSerializer(serializers.ModelSerializer):
+    version = serializers.IntegerField(source='version.version', read_only=True)
+
+    class Meta:
+        model = PackageAlias
+        fields = ['name', 'version', 'updated_at']
 
 
 class PackageListItemSerializer(serializers.ModelSerializer):
@@ -108,13 +91,18 @@ class PackageListItemSerializer(serializers.ModelSerializer):
 class PackageDetailSerializer(serializers.ModelSerializer):
     type = serializers.CharField(source='package_type.name', read_only=True)
     versions = serializers.SerializerMethodField()
+    aliases = serializers.SerializerMethodField()
 
     class Meta:
         model = Package
-        fields = ['name', 'type', 'created_at', 'versions']
+        fields = ['name', 'type', 'created_at', 'versions', 'aliases']
 
     def get_versions(self, obj):
         qs = obj.versions.order_by('-version').select_related(
-            'author', 'package__package_type', 'forked_from__package'
+            'author', 'package__package_type', 'forked_from__package',
         )
         return PackageVersionSerializer(qs, many=True).data
+
+    def get_aliases(self, obj):
+        qs = obj.aliases.select_related('version').order_by('name')
+        return PackageAliasSerializer(qs, many=True).data
