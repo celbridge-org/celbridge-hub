@@ -22,3 +22,10 @@ pip install -r requirements.txt
 ```
 
 To run the test suite instead of the dev server: **python manage.py** test.     
+
+
+NOTE
+- you may need to update /file_upload_api/settings.py local hostts:
+```
+ALLOWED_HOSTS = ['127.0.0.1', 'localhost']
+```

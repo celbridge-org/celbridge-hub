@@ -67,7 +67,7 @@ Version 2
 
 - here is an example is for a package named 'piskel-editor'
     - it describes the history of the package, take from the DB tables of this system, listing the history in most-recent-first to oldest-last sequence
-    - this example shows that this 'piskel-editor' v1 was based on a different package, 'matt-editor v10'       
+    - this example shows that this 'piskel-editor' v1 was based ('forked') on a different package, 'matt-editor v10'       
         ```markdown
         # piskel-editor v2
         
@@ -90,11 +90,14 @@ Version 2
         
         Added a pencil tool
         ```
+-[] case for a fork - for a new package name
+    - when a package is uploaded, if the package name ("new package name") in the  `package.toml` does not match any existing package, then it will become Version 1, but if its ZIP contains a 'history.md' for a differently named package ("original package name"), then record in the database and new 'history.md'  file that "new package name" version 1 is based on whatever version of "original package name" was in the uploaded 'history.md'
+    - in the example 'history.md' above, this would have occured when a package was uploaded named 'piskel-editor' in the `package.toml`, and whose 'history.md' was 'matt-editor' version 10
 
--[] add 2 new end points, for the 'forking' of an existing package version to a new package
-    - the first forks from the latest version of the package ID
-      - POST /api/upload/fork-pacakge/<int:packageID>
-  - the second forks from the named version of the package ID
-      - POST /api/upload/fork-package-version/<int:versionID>
-    
+    -[] however, if forking seems to be attempted where there is already a package in the systems database for the package named in`package.toml`, 
+        - then do not create the fork, and reject the upload, and return an error message "invalid package form - package <new package name> alreasdy exists, so cannot become version 1 of a forked version <v> of package <original package name> named in the uploaded 'history.md'"
+
+
+
+-[] create appropriate Vite and Playwrite tests, to test the features above
 
