@@ -30,7 +30,6 @@ DJANGO_SUPERUSER_PASSWORD=PASSWORD-HERE \
 python manage.py createsuperuser --noinput
 
 
-```
 
 
 

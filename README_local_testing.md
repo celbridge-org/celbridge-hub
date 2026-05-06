@@ -38,3 +38,7 @@ if wipe DB you'll need to:
 1. create a new superuser
 2. create new client user
 
+
+rm -f db.sqlite3
+python manage.py migrate
+python manage.py createsuperuser
