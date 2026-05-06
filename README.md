@@ -75,12 +75,56 @@ The API will be available at http://127.0.0.1:8000.
 
 ## API Endpoints
 
+### v2 — Packages (current)
+
+| Method | Endpoint                                  | Description                                | Auth     |
+| ------ | ----------------------------------------- | ------------------------------------------ | -------- |
+| POST   | `/api/packages/upload/`                   | Upload package (new or new version)        | required |
+| GET    | `/api/packages/`                          | List all packages (latest version each)    | public   |
+| GET    | `/api/packages/<name>/`                   | Package detail + version list              | public   |
+| GET    | `/api/packages/<name>/v<n>/`              | Download a specific version's ZIP          | public   |
+| GET    | `/api/packages/<name>/history/`           | Generated `history.md` as text             | public   |
+| POST   | `/api/packages/<name>/v<n>/tombstone/`    | Tombstone (soft-delete) a version          | required |
+
+Uploaded ZIPs must contain a `package.toml` at the root:
+
+```toml
+[package]
+name    = "tiptap-notes"
+type    = "mod"            # required: "mod", "project", or "app"
+author  = "celbridge"
+license = "MIT"            # ignored in v2
+tags    = ["editor"]       # ignored in v2
+```
+
+Notes:
+- Uploads of an existing package name become the next version automatically.
+- Any `history.md` inside the uploaded ZIP is replaced with one regenerated
+  from the database (the DB is the source of truth).
+- A new package whose embedded `history.md` references a different existing
+  package's version is recorded as a fork (v1 with a pointer to the
+  ancestor).
+- Packages of `type = "app"` have their latest version extracted to
+  `/public/<name>/`. Packages of type `mod` or `project` are downloadable
+  but not web-published.
+- Tombstoning soft-deletes a version: the row survives (so history is
+  intact), the ZIP is removed, and `GET /api/packages/<name>/v<n>/` returns
+  `410 Gone`. If the tombstoned version was the latest of an `app` package,
+  `/public/<name>/` is wiped.
+
+### Deprecated endpoints
+
+The pre-v2 file endpoints below remain operational but are deprecated and
+will be removed in v3 or v4. Each response carries `Deprecation: true`,
+`Sunset`, and `Link: <successor>; rel="successor-version"` headers per
+RFC 8594.
+
 | Method | Endpoint                  | Description              |
 | ------ | ------------------------- | ------------------------ |
-| POST   | `/api/upload/`            | Upload a file            |
-| GET    | `/api/files/`             | List uploaded files      |
-| GET    | `/api/files/<id>/`        | Download a specific file |
-| DELETE | `/api/files/<id>/delete/` | Delete a file by ID      |
+| POST   | `/api/upload/`            | Upload a file (deprecated) |
+| GET    | `/api/files/`             | List uploaded files (deprecated) |
+| GET    | `/api/files/<id>/`        | Download a specific file (deprecated) |
+| DELETE | `/api/files/<id>/delete/` | Delete a file by ID (deprecated) |
 
 ## Example with cURL
 

@@ -19,16 +19,19 @@ python manage.py changepassword admin
 
 Claude suggested this: (set 'admin' user password to 'admin')
 
-```sveltehtml
+```
 If you'd rather script it non-interactively (handy for resetting locally):
 
 source venv/bin/activate
 
-DJANGO_SUPERUSER_USERNAME=admin \             DJANGO_SUPERUSER_EMAIL=admin@example.com 
-  DJANGO_SUPERUSER_PASSWORD=admin \
-  python manage.py createsuperuser --noinput    
+DJANGO_SUPERUSER_USERNAME=NAME-HERE \
+DJANGO_SUPERUSER_EMAIL=admin@example.com \
+DJANGO_SUPERUSER_PASSWORD=PASSWORD-HERE \
+python manage.py createsuperuser --noinput
+
 
 ```
+
 
 
 == to create a user 'fred' with password 'burgers123':

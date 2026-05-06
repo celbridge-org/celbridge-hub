@@ -5,8 +5,10 @@ You have a **venv** already in the project. Run from the project root:
 ```bash
 source venv/bin/activate                                                                                                                                                                      
 python manage.py migrate          # if you haven't already, or after model changes                                                                                                            
-python manage.py runserver 8001
+python manage.py runserver --insecure  
 ```
+
+insecure should allow serving of CSS files !
 
 Then hit it at http://127.0.0.1:8000 (default port) or http://127.0.0.1:8001 if you used 8001 as in the README's last snippet.
 

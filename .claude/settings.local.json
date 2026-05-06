@@ -10,7 +10,10 @@
       "Read(//tmp/**)",
       "Read(//private/tmp/**)",
       "Bash(curl -s -b /tmp/cj.txt -e http://127.0.0.1:8001/admin/login/ -X POST http://127.0.0.1:8001/admin/login/ -d \"username=week12&password=qhzuR%23J-m42q6fAF%21aeA&csrfmiddlewaretoken=$\\(grep csrftoken /tmp/cj.txt)",
-      "Bash(curl -sS -o /tmp/dj.html -w \"HTTP %{http_code}\\\\nfinal URL: %{url_effective}\\\\nsize: %{size_download}\\\\n\" http://127.0.0.1:8000/)"
+      "Bash(curl -sS -o /tmp/dj.html -w \"HTTP %{http_code}\\\\nfinal URL: %{url_effective}\\\\nsize: %{size_download}\\\\n\" http://127.0.0.1:8000/)",
+      "Bash(python3 -c \"import tomllib; print\\('tomllib available'\\)\")",
+      "Bash(python3 -c \"import tomli; print\\('tomli available'\\)\")",
+      "Bash(python manage.py test file_manager.tests_v2)"
     ]
   }
 }
