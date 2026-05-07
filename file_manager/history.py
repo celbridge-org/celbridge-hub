@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import re
 
-from .models import Package, PackageAlias, PackageVersion
+from .models import Package, PackageVersion
 
 
 _SNAPSHOT_BLOCKQUOTE = (
@@ -114,19 +114,6 @@ def _ancestor_section(
     return f'---\n\n{heading}\n\n{body}', versions[-1]
 
 
-def _render_aliases_table(package: Package) -> str:
-    aliases = list(
-        PackageAlias.objects
-        .filter(package=package)
-        .select_related('version')
-        .order_by('name')
-    )
-    lines = ['## Aliases', '', '| Name | Version |', '|---|---|']
-    for alias in aliases:
-        lines.append(f'| {alias.name} | {alias.version.version} |')
-    return '\n'.join(lines)
-
-
 def render_history(package: Package) -> str:
     """Return the full `HISTORY.md` text for a package, including any fork
     chain. Newest version first."""
@@ -141,8 +128,6 @@ def render_history(package: Package) -> str:
         f'# Package History: {package.name}',
         '',
         _SNAPSHOT_BLOCKQUOTE,
-        '',
-        _render_aliases_table(package),
         '',
         '## Versions',
     ]

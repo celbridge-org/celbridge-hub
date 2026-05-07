@@ -85,22 +85,16 @@ def v3_history(name: str, latest_version: int) -> str:
     return '\n'.join(parts)
 
 
-def v4_history(name: str, latest_version: int, aliases: dict | None = None) -> str:
-    """Build a minimal v4-format HISTORY.md with optional Aliases table."""
+def v4_history(name: str, latest_version: int) -> str:
+    """Build a minimal v4-format HISTORY.md for tests."""
     parts = [
         f'# Package History: {name}',
         '',
         '> Authoritative copy lives on the server. This file is a snapshot at publish time.',
         '',
-        '## Aliases',
+        '## Versions',
         '',
-        '| Name | Version |',
-        '|---|---|',
     ]
-    aliases = aliases or {'latest': latest_version}
-    for alias_name, ver in sorted(aliases.items()):
-        parts.append(f'| {alias_name} | {ver} |')
-    parts.extend(['', '## Versions', ''])
     for n in range(latest_version, 0, -1):
         parts.extend([
             f'### Version {n}',
@@ -152,13 +146,11 @@ class PackageTomlParseTests(TestCase):
             self._parse({'package.toml': package_toml(type_='app')})
 
     def test_top_history_header_parser_v4_format(self):
-        # v4 format places `## Aliases` before `## Versions` — parser must
-        # locate `## Versions` by name, not by "first H2".
         text = v4_history('foo', 7)
         self.assertEqual(parse_top_history_header(text), ('foo', 7))
 
     def test_top_history_header_parser_picks_max_version(self):
-        text = v4_history('foo', 5, aliases={'latest': 5, 'stable': 3})
+        text = v4_history('foo', 5)
         self.assertEqual(parse_top_history_header(text), ('foo', 5))
 
     def test_top_history_header_parser_rejects_v2_format(self):
@@ -651,9 +643,6 @@ class ForkDetectionTests(TestCase):
         self.assertEqual(resp.data['forked_from']['version'], 1)
 
     def test_fork_detected_with_v3_history_still_works(self):
-        # Ancestor history without a `## Aliases` section is still
-        # recognised — the parser locates `## Versions` by name, not by
-        # "first H2".
         publish(self.client, 'matt-editor', {'package.toml': package_toml(name='matt-editor', author='matt')})
         resp = publish(
             self.client, 'piskel-editor',
@@ -690,53 +679,20 @@ class HistoryRenderTests(TestCase):
         text = render_history(Package.objects.get(name='demo'))
         self.assertIn('> Authoritative copy lives on the server', text)
 
-    def test_aliases_table_includes_latest(self):
-        publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
-        publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
-        text = render_history(Package.objects.get(name='demo'))
-        self.assertIn('## Aliases', text)
-        self.assertIn('| Name | Version |', text)
-        self.assertIn('| latest | 2 |', text)
-
-    def test_aliases_table_sorted_by_name(self):
-        publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
-        publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
+    def test_aliases_section_omitted(self):
+        # HISTORY.md is a snapshot at publish time and is never regenerated,
+        # so mutable alias state is intentionally excluded — clients should
+        # query /api/packages/{name}/aliases for current alias mappings.
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         self.client.put(
             '/api/packages/demo/aliases/stable',
-            data=json.dumps({'version': 2}),
-            content_type='application/json',
-        )
-        self.client.put(
-            '/api/packages/demo/aliases/playtest-03',
             data=json.dumps({'version': 1}),
             content_type='application/json',
         )
         text = render_history(Package.objects.get(name='demo'))
-        # Sorted: latest, playtest-03, stable.
-        latest_pos = text.index('| latest |')
-        playtest_pos = text.index('| playtest-03 |')
-        stable_pos = text.index('| stable |')
-        self.assertLess(latest_pos, playtest_pos)
-        self.assertLess(playtest_pos, stable_pos)
-
-    def test_empty_aliases_table_when_no_aliases(self):
-        # Register without publishing → no aliases.
-        self.client.post(
-            '/api/packages',
-            data=json.dumps({'name': 'empty', 'type': 'mod'}),
-            content_type='application/json',
-        )
-        text = render_history(Package.objects.get(name='empty'))
-        self.assertIn('## Aliases', text)
-        self.assertIn('| Name | Version |', text)
-        # No data rows.
-        aliases_section = text.split('## Aliases', 1)[1].split('## Versions', 1)[0]
-        data_rows = [
-            line for line in aliases_section.splitlines()
-            if line.startswith('| ') and not line.startswith('| Name') and not line.startswith('|---')
-        ]
-        self.assertEqual(data_rows, [])
+        self.assertNotIn('## Aliases', text)
+        self.assertNotIn('| latest |', text)
+        self.assertNotIn('| stable |', text)
 
     def test_versions_section_unchanged(self):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo', author='a')}, summary='hi')
@@ -789,7 +745,7 @@ class ReadAPITests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn('text/markdown', resp['Content-Type'])
         self.assertIn(b'# Package History: demo', resp.content)
-        self.assertIn(b'## Aliases', resp.content)
+        self.assertNotIn(b'## Aliases', resp.content)
 
 
 # ---------------------------------------------------------------------------

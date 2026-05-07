@@ -13,7 +13,9 @@
       "Bash(curl -sS -o /tmp/dj.html -w \"HTTP %{http_code}\\\\nfinal URL: %{url_effective}\\\\nsize: %{size_download}\\\\n\" http://127.0.0.1:8000/)",
       "Bash(python3 -c \"import tomllib; print\\('tomllib available'\\)\")",
       "Bash(python3 -c \"import tomli; print\\('tomli available'\\)\")",
-      "Bash(python manage.py test file_manager.tests_v2)"
+      "Bash(python manage.py test file_manager.tests_v2)",
+      "Bash(/Users/matt/Documents/github/____CB/django-file_upload_API/venv/bin/python manage.py test file_manager)",
+      "Bash(/Users/matt/Documents/github/____CB/django-file_upload_API/venv/bin/python manage.py test file_manager.tests_v4)"
     ]
   }
 }
