@@ -114,15 +114,28 @@ def _ancestor_section(
     return f'---\n\n{heading}\n\n{body}', versions[-1]
 
 
-def render_history(package: Package) -> str:
-    """Return the full `HISTORY.md` text for a package, including any fork
-    chain. Newest version first."""
-    versions = list(
+def render_history(
+    package: Package,
+    *,
+    max_version: int | None = None,
+) -> str:
+    """Return the `HISTORY.md` text for a package, including any fork
+    chain. Newest version first.
+
+    If `max_version` is set, only this package's own versions ≤ that
+    number are rendered. The fork-walk that follows is unaffected — it
+    still descends from the oldest *shown* version of this package and
+    walks ancestors from their fork point downward.
+    """
+    qs = (
         PackageVersion.objects
         .filter(package=package)
         .select_related('author', 'forked_from__package')
         .order_by('-version')
     )
+    if max_version is not None:
+        qs = qs.filter(version__lte=max_version)
+    versions = list(qs)
 
     parts = [
         f'# Package History: {package.name}',

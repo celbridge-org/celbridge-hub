@@ -6,10 +6,11 @@ from .views import (
     PackageHistoryView,
     PackageLatestDownloadView,
     PackagesView,
-    PackageView,
     PackageVersionDownloadView,
+    PackageVersionHistoryView,
     PackageVersionView,
     PackageVersionsView,
+    PackageView,
 )
 
 
@@ -47,6 +48,11 @@ urlpatterns = [
         rf'^packages/{NAME}/versions/{N}/download/?$',
         PackageVersionDownloadView.as_view(),
         name='package-version-download',
+    ),
+    re_path(
+        rf'^packages/{NAME}/versions/{N}/history/?$',
+        PackageVersionHistoryView.as_view(),
+        name='package-version-history',
     ),
     re_path(
         rf'^packages/{NAME}/aliases/?$',

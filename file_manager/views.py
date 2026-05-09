@@ -438,6 +438,25 @@ class PackageHistoryView(APIView):
 
 
 # ---------------------------------------------------------------------------
+# /api/packages/<name>/versions/<n>/history
+# ---------------------------------------------------------------------------
+
+class PackageVersionHistoryView(APIView):
+    """Render HISTORY.md as-of version <n>: this package's versions 1..n
+    (newest first) plus the fork chain rooted at version 1. Versions > n
+    are not rendered. Tombstoned <n> still renders (with the tombstone
+    marker); only an unknown <n> returns 404."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, name, n):
+        package = get_object_or_404(Package, name=name)
+        get_object_or_404(PackageVersion, package=package, version=n)
+        text = render_history(package, max_version=int(n))
+        return HttpResponse(text, content_type='text/markdown; charset=utf-8')
+
+
+# ---------------------------------------------------------------------------
 # /api/packages/<name>/aliases
 # ---------------------------------------------------------------------------
 
