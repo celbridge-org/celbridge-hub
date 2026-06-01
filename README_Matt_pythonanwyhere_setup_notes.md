@@ -18,25 +18,21 @@ open a new Bash console from PythonAnywhere dashboard
 ## setup and use virtual environment
 
 ```bash
-mkvirtualenv --python=python3.10 myenv
+mkvirtualenv --python=python3.13 myenv
 workon myenv
 ```
+
+
 
 ## Clone the repo
 
 ```bash
 git clone https://github.com/dr-matt-smith/django-file_upload_API
+cd django-file_upload_API/
 cd file_upload_api
 ```
 
-## Create & activate virtual environment
-
-```
-python -m venv env
-source env/bin/activate
-```
-
-## check `settings.py `
+## check `/django-file_upload_API/file_upload_api/settings.py `
 
 for version 1 SQLLite settings should be:
 
@@ -55,6 +51,7 @@ for this PythonAnywhere project the file will be here:
 ## Install Python dependencies
 
 ```
+cd ..
 pip install -r requirements.txt
 ```
 
@@ -80,6 +77,12 @@ Add local environment to `ALLOWED_HOSTS`
 ```python
 ALLOWED_HOSTS = ['antulcha.eu.pythonanywhere.com', 'localhost', '127.0.0.1']
 ```
+
+or
+```python
+ALLOWED_HOSTS = ['drmattsmith.pythonanywhere.com', 'localhost', '127.0.0.1']
+```
+
 
 
 ## Configuration of media for base URL in `settings.py`
@@ -129,11 +132,13 @@ After creation, scroll down the Web tab and set:
 - Source code:
     ```
     /home/AnTulcha/django-file_upload_API
+    /home/drmattsmith/django-file_upload_API
     ```
 
 - Working directory:
     ```
     /home/AnTulcha/django-file_upload_API
+    /home/drmattsmith/django-file_upload_API
     ```
 
 - Virtualenv:
@@ -148,22 +153,24 @@ see ![](/screenshots/python_web_dashboard.png)
 Click the WSGI configuration file link near the top of the Web tab (it'll be something like `/var/www/antulcha_pythonanywhere_com_wsgi.py`).
 
 Delete everything in it and replace with:
-  ```
-   pythonimport os
-   import sys
-  
-  path = '/home/yourusername/django-file_upload_API'
-  if path not in sys.path:
-  sys.path.insert(0, path)
-  
-  os.environ['DJANGO_SETTINGS_MODULE'] = 'file_upload_api.settings'
-  
-  # Load .env so DJANGO_SECRET_KEY etc. are available
-  from dotenv import load_dotenv
-  load_dotenv(os.path.join(path, '.env'))
-  
-  from django.core.wsgi import get_wsgi_application
-  application = get_wsgi_application()
+```python
+import os
+import sys
+
+path = '/home/AnTulcha/django-file_upload_API'
+path = '/home/drmattsmith/django-file_upload_API'
+
+if path not in sys.path:
+    sys.path.insert(0, path)
+
+os.environ['DJANGO_SETTINGS_MODULE'] = 'file_upload_api.settings'
+
+# Load .env so DJANGO_SECRET_KEY etc. are available
+from dotenv import load_dotenv
+load_dotenv(os.path.join(path, '.env'))
+
+from django.core.wsgi import get_wsgi_application
+application = get_wsgi_application()
   ```
 
 
@@ -179,12 +186,14 @@ On the Web tab, scroll to Media  and add:
   - `/media/`
 - Directory
   - `/home/AnTulcha/django-file_upload_API/media`
+  - `/home/drmattsmith/django-file_upload_API/media`
 
 now add static
 - URL:
   - `/static/`
 - Directory
   - `/home/AnTulcha/django-file_upload_API/staticfiles`
+  - `/home/drmattsmith/django-file_upload_API/staticfiles`
 
 NOTE: not sure about typoes - but for me 'AnTulcha' had to be same caps-case as PythonAnywhere user account
 
@@ -196,6 +205,7 @@ hopefully it all now works:
 - via API client
 - via admin web access:
   - https://antulcha.eu.pythonanywhere.com/admin
+  - https://drmattsmith.pythonanywhere.com/admin
 
 if it has gone well, you'll be presented with a login page
 - but there is no admin user yet :-)
@@ -207,3 +217,24 @@ python manage.py createsuperuser
 ```
 
 Then Hit the green Reload button on the Web tab, and try to login again
+
+
+## Fix - if admin page loads, but CSS files not working
+
+In a Bash console (with your venv active):
+```bash
+workon myenv
+cd ~/django-file_upload_API                                                                                          
+
+python manage.py collectstatic --noinput
+```
+
+This copies Django admin's CSS/JS (and any other app static files) into your STATIC_ROOT folder — staticfiles/ per your settings (line 119  
+of your notes).
+
+Then on the Web tab, scroll down to Static files and confirm there's a mapping:
+
+- URL: `/static/`
+- Directory: `/home/<youruser>/django-file_upload_API/staticfiles`
+
+Hit the green Reload button, then refresh the admin page.   

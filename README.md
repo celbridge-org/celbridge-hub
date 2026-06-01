@@ -33,6 +33,7 @@ The API is built using Django REST Framework and is accessible without authentic
 ## Clone the repo
 
 git clone https://github.com/dr-matt-smith/django-file_upload_API
+cd django-file_upload_API/
 cd file_upload_api
 ```
 ## Create virtual environment
@@ -45,6 +46,7 @@ source env/bin/activate
 ## Install dependencies
 
 ```
+cd ..
 pip install -r requirements.txt
 
 ```
