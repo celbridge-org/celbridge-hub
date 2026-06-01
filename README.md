@@ -1,11 +1,14 @@
 
-# File Upload API
+# celbridge-hub
 
-A simple Django REST API to upload, retrieve, list, and delete files.
+Prototype of a simple package repository server for the Celbridge Workbench application
+
+NOTE:
+- a Python client compatable with this API server can be found at: https://github.com/celbridge-org/celbridge-hub-api-client
 
 ## Overview
 
-The file_upload_api project includes a single app, file_manager, which implements the following features:
+This celbridge-hub project includes a single app, file_manager, which implements the following features:
 
 - Upload Files: Accept file uploads via a POST endpoint.
 
@@ -17,7 +20,7 @@ The file_upload_api project includes a single app, file_manager, which implement
 
 - Files are stored in the MEDIA_ROOT directory, organized by date (uploads/YYYY/MM/DD/).
 
-The API is built using Django REST Framework and is accessible without authentication (using AllowAny permissions) for simplicity, making it ideal for development and testing.
+The API is built using Django REST Framework.
 
 
 
@@ -32,7 +35,7 @@ The API is built using Django REST Framework and is accessible without authentic
 ```
 ## Clone the repo
 
-git clone https://github.com/dr-matt-smith/django-file_upload_API
+git clone https://github.com/celbridge-org/celbridge-hub
 cd django-file_upload_API/
 cd file_upload_api
 ```
