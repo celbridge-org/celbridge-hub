@@ -1,4 +1,7 @@
-# Package Hub API
+
+# celbridge-hub
+
+Prototype of a simple package repository server for the Celbridge Workbench application
 
 A Django REST API for publishing, versioning, and serving **packages**,
 with per-organisation isolation and a static-site **pages** publishing
@@ -9,6 +12,12 @@ feature.
 > (no anonymous access), package types removed, and a new `pages`
 > publish feature. See `TDDs/project_design_version07.md` and
 > `TDDs/version07_implementation_plan.md` for the full design.
+
+
+
+NOTE:
+- a Python client compatable with this API server can be found at: https://github.com/celbridge-org/celbridge-hub-api-client
+
 
 ## Overview
 
