@@ -67,6 +67,17 @@ class PublishTests(PagesTestBase):
         self.assertFalse(os.path.exists(os.path.join(d, 'src')))
         self.assertFalse(os.path.exists(os.path.join(d, 'public')))   # prefix stripped
 
+    def test_directory_url_serves_index_html(self):
+        # The publish API returns the directory URL; a bare-directory GET
+        # must resolve to index.html (with or without a trailing slash).
+        publish(self.c, 'site', site_files(body=b'<h1>idx</h1>'))
+        self.c.post('/api/publish/site')
+        for url in ('/pages/a/site/', '/pages/a/site'):
+            resp = self.c.get(url)
+            self.assertEqual(resp.status_code, 200, msg=url)
+            body = b''.join(resp.streaming_content)
+            self.assertEqual(body, b'<h1>idx</h1>', msg=url)
+
     def test_publish_without_public_folder_422(self):
         publish(self.c, 'plain', {'package.toml': package_toml(name='plain', author='a')})
         resp = self.c.post('/api/publish/plain')
