@@ -7,11 +7,18 @@ A Django REST API for publishing, versioning, and serving **packages**,
 with per-organisation isolation and a static-site **pages** publishing
 feature.
 
-> **Version 7 (current).** v7 is a breaking, clean-start release:
-> per-organisation isolation, API-key authentication on every endpoint
-> (no anonymous access), package types removed, and a new `pages`
-> publish feature. See `TDDs/project_design_version07.md` and
-> `TDDs/version07_implementation_plan.md` for the full design.
+> **Version 8 (current).** v8 **decouples pages from packages**. Pages
+> are no longer published from a package's `public/` folder — a page is
+> its own ZIP upload to `POST /api/pages`, served at a path declared in
+> a `pages.toml` manifest (`/pages/<org-slug>/<path>/`). The v7
+> package-publish feature (`/api/publish/<name>`, the `public/` contract,
+> the tombstone takedown) is removed. See
+> `TDDs/project_design_version08.md` and
+> `TDDs/version08_implementation_plan.md` for the full design.
+>
+> v7 introduced the foundations that still apply: per-organisation
+> isolation, API-key authentication on every endpoint (no anonymous
+> access), and package types removed.
 
 
 
@@ -38,8 +45,10 @@ under `/api/`. The core concepts:
   organisation.
 - **Alias** — named pointers to versions. `latest` is managed
   automatically; you may set your own (e.g. `stable`).
-- **Pages** — a package version's `public/` folder can be explicitly
-  published to a world-readable URL at `/pages/<org-slug>/<name>/`.
+- **Pages** — a standalone feature (decoupled from packages in v8). A
+  ZIP is uploaded to `POST /api/pages`; its `pages.toml` declares a
+  publish path, and the ZIP's contents are served world-readable at
+  `/pages/<org-slug>/<path>/`.
 
 Every `/api/` endpoint requires authentication (an API key or an
 org-member session). **There is no anonymous access.** The only
@@ -149,20 +158,20 @@ All routes are under `/api/` and require an org context.
 | PUT    | `/api/packages/<name>/aliases/<alias>`        | Set/move a user alias to a version       |
 | DELETE | `/api/packages/<name>/aliases/<alias>`        | Remove a user alias                      |
 
-### Pages (publish a package's `public/` folder)
+### Pages (standalone ZIP publishing)
 
-| Method | Endpoint                          | Description                                       |
-| ------ | --------------------------------- | ------------------------------------------------- |
-| POST   | `/api/publish/<name>`             | Publish the **latest** version's `public/` folder |
-| DELETE | `/api/publish/<name>`             | Unpublish (remove the served files)               |
-| GET    | `/api/publish/<name>`             | Current published version + timestamp             |
-| GET    | `/api/publish/<name>/history`     | Full publication log (newest first)               |
+| Method | Endpoint                  | Description                                          |
+| ------ | ------------------------- | --------------------------------------------------- |
+| POST   | `/api/pages`              | Publish a ZIP bundle (path from its `pages.toml`)   |
+| GET    | `/api/pages`              | List this org's live pages                          |
+| GET    | `/api/pages/<path>`       | Metadata for one live page                          |
+| DELETE | `/api/pages/<path>`       | Unpublish (remove the served files)                 |
 
 ### Served static output (public, no auth)
 
 | Method | Endpoint                            | Description                          |
 | ------ | ----------------------------------- | ------------------------------------ |
-| GET    | `/pages/<org-slug>/<name>/...`      | The published `public/` folder       |
+| GET    | `/pages/<org-slug>/<path>/...`      | The published page bundle            |
 
 ## The `package.toml` manifest
 
@@ -190,33 +199,40 @@ Notes:
 
 ## The pages feature
 
-A package version's ZIP may contain a top-level `public/` directory:
+Pages are **decoupled from packages** (v8). A page is its own ZIP upload
+containing a top-level `pages.toml` plus all the files to publish. The
+ZIP root *is* the site:
 
 ```
-homepage.zip
-├── package.toml
-├── src/...            ← private, never served
-└── public/            ← this subtree is what /api/publish exposes
-    ├── index.html
-    └── style.css
+chess24.zip
+├── pages.toml         ← declares the publish path (not served)
+├── index.html
+├── style.css
+└── assets/logo.png
 ```
 
-`POST /api/publish/homepage` extracts that `public/` subtree (the
-`public/` prefix is stripped) and serves it at
-`/pages/<org-slug>/homepage/`. Key behaviours:
+`pages.toml` carries a single `[publish].path` (for now):
 
-- **Latest-only.** Publish always snapshots the current latest version.
-  Uploading a new version does *not* auto-publish — the live page stays
-  pinned until you publish again. `GET /api/publish/<name>` reports the
-  currently-published version, which can lag the head.
-- **Destructive replace.** Each publish wipes and rewrites the served
-  directory; only one live state per package.
-- **Stored history.** Every publish/unpublish is logged
-  (`GET /api/publish/<name>/history`), even though only the latest is
-  on disk.
-- **Tombstone auto-takedown.** Tombstoning the *currently-published*
-  version immediately removes the served files and logs an `unpublish`
-  (reason `tombstoned`) — a safe "take it down now" reflex.
+```toml
+[publish]
+path = "dev/chess24"
+```
+
+`POST /api/pages` (with the ZIP) reads that path and serves the bundle's
+contents (everything except `pages.toml`) at `/pages/<org-slug>/<path>/`
+— e.g. `/pages/acme/dev/chess24/`. Key behaviours:
+
+- **Path is the identity.** Manage a page by its path:
+  `GET`/`DELETE /api/pages/<path>`. Re-uploading to the **same** path is
+  a destructive replace (the served directory is wiped and rewritten).
+- **No overlap.** A path may not be a segment-prefix of, or contain,
+  another live path in the org — e.g. with `dev/chess24` live, both
+  `dev` and `dev/chess24/beta` are rejected with `409`. A sibling like
+  `dev/chess` is fine.
+- **No package coupling.** Uploading, tombstoning, or deleting a package
+  never affects any page.
+- **Internal audit log.** Every publish/unpublish is recorded for admin
+  inspection (no public history endpoint).
 
 ## Examples with cURL
 
@@ -231,17 +247,18 @@ curl -H "Authorization: Api-Key $KEY" \
      -F "file=@homepage.zip" \
      http://127.0.0.1:8000/api/packages/homepage/versions
 
-# Publish the latest version's public/ folder as a page
+# Publish a page bundle (ZIP with a pages.toml declaring path = "dev/chess24")
 curl -X POST -H "Authorization: Api-Key $KEY" \
-     http://127.0.0.1:8000/api/publish/homepage
-# → {"package":"homepage","version":1,"published_at":"...","url":"/pages/acme/homepage/"}
+     -F "file=@chess24.zip" \
+     http://127.0.0.1:8000/api/pages
+# → {"path":"dev/chess24","url":"/pages/acme/dev/chess24/","published_at":"...","content_hash":"..."}
 
 # Fetch the served page (no auth)
-curl http://127.0.0.1:8000/pages/acme/homepage/index.html
+curl http://127.0.0.1:8000/pages/acme/dev/chess24/index.html
 
 # Unpublish
 curl -X DELETE -H "Authorization: Api-Key $KEY" \
-     http://127.0.0.1:8000/api/publish/homepage
+     http://127.0.0.1:8000/api/pages/dev/chess24
 ```
 
 ## Testing

@@ -11,8 +11,8 @@ from .views import (
     PackageVersionView,
     PackageVersionsView,
     PackageView,
-    PagePublishHistoryView,
-    PagePublishView,
+    PagesView,
+    PageView,
 )
 
 
@@ -21,6 +21,8 @@ NAME = r'(?P<name>[\w][\w.\-]*)'
 N = r'(?P<n>\d+)'
 # Alias regex narrowed in view code (no leading/trailing dashes, no `--`).
 ALIAS = r'(?P<alias>[a-z][a-z0-9-]*)'
+# Page publish path: multi-segment, validated in view code (slug segments).
+PATH = r'(?P<path>.+)'
 
 
 urlpatterns = [
@@ -66,14 +68,6 @@ urlpatterns = [
         PackageAliasView.as_view(),
         name='package-alias',
     ),
-    re_path(
-        rf'^publish/{NAME}/history/?$',
-        PagePublishHistoryView.as_view(),
-        name='page-publish-history',
-    ),
-    re_path(
-        rf'^publish/{NAME}/?$',
-        PagePublishView.as_view(),
-        name='page-publish',
-    ),
+    re_path(r'^pages/?$', PagesView.as_view(), name='pages'),
+    re_path(rf'^pages/{PATH}$', PageView.as_view(), name='page'),
 ]

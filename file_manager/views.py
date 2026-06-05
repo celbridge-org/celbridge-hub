@@ -27,6 +27,7 @@ from .models import (
     Package,
     PackageAlias,
     PackageVersion,
+    Page,
     SiteConfiguration,
 )
 from .package_parsing import PackageValidationError
@@ -35,11 +36,16 @@ from .package_pipeline import (
     process_upload,
 )
 from .pages import (
-    NoPublicFolderError,
-    current_publication,
+    PathOverlapError,
+    check_overlap,
     page_url,
-    publish_latest,
+    publish,
     unpublish,
+)
+from .pages_parsing import (
+    PagesValidationError,
+    parse_pages_zip,
+    validate_publish_path,
 )
 from .permissions import resolve_org
 from .serializers import (
@@ -47,7 +53,7 @@ from .serializers import (
     PackageDetailSerializer,
     PackageListItemSerializer,
     PackageVersionSerializer,
-    PagePublicationSerializer,
+    PageSerializer,
 )
 
 
@@ -121,14 +127,8 @@ def _tombstone_version(version_obj: PackageVersion, reason: str) -> bool:
     ).exists():
         _move_or_drop_latest(package)
 
-    # Page takedown: only when the tombstoned version is the one currently
-    # published — NOT merely the head. A tombstone is a "take it down now"
-    # action; keying on the live version (which can lag the head) is the
-    # correct trigger.
-    pub = current_publication(package)
-    if pub is not None and pub.version_id == version_obj.id:
-        unpublish(package, reason='tombstoned')
-
+    # v8: tombstoning a version no longer touches pages — the two features
+    # are fully decoupled. Pages are taken down only via DELETE /api/pages.
     return True
 
 
@@ -202,9 +202,6 @@ class PackageView(OrgScopedView):
             ):
                 _tombstone_version(version, reason)
             PackageAlias.objects.filter(package=package).delete()
-
-        # Belt-and-braces: ensure no served page survives the takedown.
-        unpublish(package, reason='tombstoned')
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -538,54 +535,107 @@ class PackageAliasView(OrgScopedView):
 
 
 # ---------------------------------------------------------------------------
-# /api/publish/<name>   and   /api/publish/<name>/history
+# /api/pages   and   /api/pages/<path>
 # ---------------------------------------------------------------------------
 
-def _pub_body(package, pub):
+def _page_body(org, page):
     return {
-        'package': package.name,
-        'version': pub.version.version,
-        'published_at': pub.at.strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'url': page_url(package),
+        'path': page.path,
+        'url': page_url(org, page.path),
+        'published_at': page.published_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'content_hash': page.content_hash,
     }
 
 
-class PagePublishView(OrgScopedView):
-    """POST — publish latest version's public/ folder.
-    DELETE — unpublish (remove served files).
-    GET — current published version + timestamp."""
+class PagesView(OrgScopedView):
+    """GET — list this org's live pages. POST — publish a ZIP bundle."""
 
-    def post(self, request, name):
-        package = self.get_package(name)
-        try:
-            pub = publish_latest(package, principal_user=request.user)
-        except NoPublicFolderError:
+    def get(self, request):
+        qs = (
+            Page.objects
+            .filter(organisation=self.org)
+            .select_related('organisation', 'published_by')
+            .order_by('-published_at')
+        )
+        return Response(PageSerializer(qs, many=True).data)
+
+    def post(self, request):
+        upload = request.FILES.get('file')
+        if upload is None:
             return Response(
-                {'detail': 'no public folder in latest version'},
+                {'detail': 'no file provided'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        max_size_mb = SiteConfiguration.get().max_file_size_mb
+        if upload.size > max_size_mb * 1024 * 1024:
+            return Response(
+                {'detail': f'File size must not exceed {max_size_mb} MB.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            parsed = parse_pages_zip(upload)
+        except PagesValidationError as exc:
+            return Response(
+                {'detail': str(exc)},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
-        return Response(_pub_body(package, pub))
 
-    def delete(self, request, name):
-        package = self.get_package(name)
-        unpublish(package, principal_user=request.user)
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        try:
+            with transaction.atomic():
+                check_overlap(self.org, parsed.path)
+                upload.seek(0)
+                page = publish(
+                    self.org, parsed.path, upload,
+                    principal_user=request.user,
+                )
+        except PathOverlapError as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-    def get(self, request, name):
-        package = self.get_package(name)
-        pub = current_publication(package)
-        if pub is None:
+        return Response(
+            _page_body(self.org, page),
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PageView(OrgScopedView):
+    """GET — metadata for one live page. DELETE — unpublish."""
+
+    def _valid_path(self, path):
+        return validate_publish_path(path)
+
+    def get(self, request, path):
+        try:
+            path = self._valid_path(path)
+        except PagesValidationError as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        page = Page.objects.filter(organisation=self.org, path=path).first()
+        if page is None:
             return Response(
                 {'detail': 'not currently published'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(_pub_body(package, pub))
+        return Response(_page_body(self.org, page))
 
-
-class PagePublishHistoryView(OrgScopedView):
-    """GET — the full publication log, newest first."""
-
-    def get(self, request, name):
-        package = self.get_package(name)
-        qs = package.page_publications.select_related('version', 'published_by')
-        return Response(PagePublicationSerializer(qs, many=True).data)
+    def delete(self, request, path):
+        try:
+            path = self._valid_path(path)
+        except PagesValidationError as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        took_down = unpublish(self.org, path, principal_user=request.user)
+        if not took_down:
+            return Response(
+                {'detail': 'not currently published'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)

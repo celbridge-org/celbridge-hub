@@ -9,6 +9,7 @@ from .models import (
     Package,
     PackageAlias,
     PackageVersion,
+    Page,
     PagePublication,
     SiteConfiguration,
 )
@@ -94,9 +95,17 @@ class PackageAliasAdmin(admin.ModelAdmin):
     search_fields = ['package__name', 'name']
 
 
+@admin.register(Page)
+class PageAdmin(admin.ModelAdmin):
+    list_display = ['path', 'organisation', 'published_at', 'published_by']
+    list_filter = ['organisation']
+    search_fields = ['path']
+    readonly_fields = ['published_at', 'content_hash']
+
+
 @admin.register(PagePublication)
 class PagePublicationAdmin(admin.ModelAdmin):
-    list_display = ['package', 'action', 'version', 'at', 'published_by', 'reason']
-    list_filter = ['action', 'package__organisation']
-    search_fields = ['package__name']
+    list_display = ['organisation', 'path', 'action', 'at', 'published_by', 'reason']
+    list_filter = ['action', 'organisation']
+    search_fields = ['path']
     readonly_fields = ['at']

@@ -1,9 +1,11 @@
-"""Tests for the v7 `pages` publish feature.
+"""Tests for the v8 standalone `pages` feature (decoupled from packages).
 
-Covers the publish/unpublish/status/history endpoints, the latest-only /
-lagging semantics, destructive replacement, the tombstone auto-takedown
-(including the false-negative and false-positive guards over the old
-`was_latest` logic), cross-org isolation, and the zip-slip guard.
+A page is published from its own ZIP upload to `POST /api/pages`. The
+served path comes from a `pages.toml` `[publish].path`; the ZIP root is
+the site. Covers publish/list/detail/unpublish, path validation, the
+segment-aware prefix-overlap rule, destructive republish, cross-org
+isolation, the zip-slip guard, the internal-only audit log, and a
+regression that package tombstone/delete never touches pages.
 """
 from __future__ import annotations
 
@@ -12,16 +14,46 @@ import shutil
 import tempfile
 
 from django.conf import settings
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
 
-from .models import PagePublication
+from .models import Page, PagePublication
 from .tests_org_isolation import key_client, make_org
-from .tests_v4 import package_toml, publish
+from .tests_v4 import make_zip, package_toml
+from .tests_v4 import publish as upload_package
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def pages_toml(path: str) -> str:
+    return f'[publish]\npath = "{path}"\n'
+
+
+def bundle(path: str, files: dict | None = None) -> dict:
+    """A pages ZIP dict: a top-level pages.toml plus site files."""
+    out = {'pages.toml': pages_toml(path)}
+    if files:
+        out.update(files)
+    return out
+
+
+def post_pages(client, files: dict):
+    upload = SimpleUploadedFile(
+        'bundle.zip', make_zip(files), content_type='application/zip',
+    )
+    return client.post('/api/pages', {'file': upload}, format='multipart')
+
+
+def served_dir(org_slug: str, path: str) -> str:
+    return os.path.join(settings.PAGES_ROOT, org_slug, *path.split('/'))
 
 
 class PagesTestBase(TestCase):
-    """Isolates PAGES_ROOT to a per-test temp dir so served files do not
-    leak across tests (Django only isolates the database, not the disk)."""
+    """Isolate PAGES_ROOT to a per-test temp dir (Django isolates the DB,
+    not the disk)."""
 
     def setUp(self):
         super().setUp()
@@ -32,21 +64,9 @@ class PagesTestBase(TestCase):
         self.addCleanup(lambda: shutil.rmtree(pages_root, ignore_errors=True))
 
 
-def site_files(name='site', body=b'<h1>hi</h1>', extra=None):
-    """A package ZIP with a top-level public/ folder."""
-    files = {
-        'package.toml': package_toml(name=name, author='alice'),
-        'public/index.html': body,
-        'src/main.py': b'print("private")',     # not under public/, never served
-    }
-    if extra:
-        files.update(extra)
-    return files
-
-
-def served_dir(org_slug, name):
-    return os.path.join(settings.PAGES_ROOT, org_slug, name)
-
+# ---------------------------------------------------------------------------
+# Publish
+# ---------------------------------------------------------------------------
 
 class PublishTests(PagesTestBase):
     def setUp(self):
@@ -54,199 +74,230 @@ class PublishTests(PagesTestBase):
         self.org = make_org('a')
         self.c = key_client(self.org)
 
-    def test_publish_writes_public_subtree_only(self):
-        publish(self.c, 'site', site_files())
-        resp = self.c.post('/api/publish/site')
-        self.assertEqual(resp.status_code, 200, resp.data)
-        self.assertEqual(resp.data['version'], 1)
-        self.assertEqual(resp.data['url'], '/pages/a/site/')
+    def test_publish_writes_zip_root_as_site(self):
+        resp = post_pages(self.c, bundle('dev/chess24', {
+            'index.html': b'<h1>hi</h1>',
+            'style.css': b'body{}',
+            'assets/logo.png': b'PNG',
+        }))
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data['path'], 'dev/chess24')
+        self.assertEqual(resp.data['url'], '/pages/a/dev/chess24/')
 
-        d = served_dir('a', 'site')
+        d = served_dir('a', 'dev/chess24')
         self.assertTrue(os.path.isfile(os.path.join(d, 'index.html')))
-        # The private subtree is NOT published.
-        self.assertFalse(os.path.exists(os.path.join(d, 'src')))
-        self.assertFalse(os.path.exists(os.path.join(d, 'public')))   # prefix stripped
+        self.assertTrue(os.path.isfile(os.path.join(d, 'assets', 'logo.png')))
+        # The manifest itself is NOT published.
+        self.assertFalse(os.path.exists(os.path.join(d, 'pages.toml')))
 
     def test_directory_url_serves_index_html(self):
-        # The publish API returns the directory URL; a bare-directory GET
-        # must resolve to index.html (with or without a trailing slash).
-        publish(self.c, 'site', site_files(body=b'<h1>idx</h1>'))
-        self.c.post('/api/publish/site')
-        for url in ('/pages/a/site/', '/pages/a/site'):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'<h1>idx</h1>'}))
+        for url in ('/pages/a/dev/chess24/', '/pages/a/dev/chess24'):
             resp = self.c.get(url)
             self.assertEqual(resp.status_code, 200, msg=url)
             body = b''.join(resp.streaming_content)
             self.assertEqual(body, b'<h1>idx</h1>', msg=url)
 
-    def test_publish_without_public_folder_422(self):
-        publish(self.c, 'plain', {'package.toml': package_toml(name='plain', author='a')})
-        resp = self.c.post('/api/publish/plain')
+    def test_missing_manifest_422(self):
+        resp = post_pages(self.c, {'index.html': b'x'})       # no pages.toml
         self.assertEqual(resp.status_code, 422)
-        self.assertEqual(resp.data['detail'], 'no public folder in latest version')
-        self.assertFalse(PagePublication.objects.filter(package__name='plain').exists())
+        self.assertIn('pages.toml', resp.data['detail'])
+        self.assertEqual(Page.objects.count(), 0)
 
-    def test_publish_unknown_package_404(self):
-        resp = self.c.post('/api/publish/nope')
-        self.assertEqual(resp.status_code, 404)
+    def test_missing_publish_path_422(self):
+        resp = post_pages(self.c, {'pages.toml': '[publish]\n', 'index.html': b'x'})
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.data['detail'], 'pages.toml missing [publish].path')
+
+    def test_invalid_paths_422(self):
+        for bad in ('../etc', '/abs', 'a//b', 'Dev/Chess', 'a/.', 'a/b/c/d/e/f/g/h/i'):
+            resp = post_pages(self.c, bundle(bad, {'index.html': b'x'}))
+            self.assertEqual(resp.status_code, 422, msg=f'{bad!r} should be rejected')
+        self.assertEqual(Page.objects.count(), 0)
+
+    def test_no_file_400(self):
+        resp = self.c.post('/api/pages', {}, format='multipart')
+        self.assertEqual(resp.status_code, 400)
 
     def test_publish_requires_auth(self):
-        from rest_framework.test import APIClient
-        publish(self.c, 'site', site_files())
-        resp = APIClient().post('/api/publish/site')
+        resp = APIClient().post('/api/pages', {}, format='multipart')
         self.assertIn(resp.status_code, (401, 403))
 
 
-class StatusAndLagTests(PagesTestBase):
+# ---------------------------------------------------------------------------
+# Overlap rejection (segment-aware)
+# ---------------------------------------------------------------------------
+
+class OverlapTests(PagesTestBase):
+    def setUp(self):
+        super().setUp()
+        self.org = make_org('a')
+        self.c = key_client(self.org)
+        self.assertEqual(
+            post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'})).status_code,
+            201,
+        )
+
+    def test_parent_path_conflicts(self):
+        resp = post_pages(self.c, bundle('dev', {'index.html': b'x'}))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('dev/chess24', resp.data['detail'])
+
+    def test_nested_path_conflicts(self):
+        resp = post_pages(self.c, bundle('dev/chess24/beta', {'index.html': b'x'}))
+        self.assertEqual(resp.status_code, 409)
+
+    def test_sibling_path_coexists(self):
+        # `dev/chess` is NOT a segment-prefix of `dev/chess24`.
+        resp = post_pages(self.c, bundle('dev/chess', {'index.html': b'x'}))
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(Page.objects.filter(organisation=self.org).count(), 2)
+
+    def test_exact_republish_is_not_overlap(self):
+        resp = post_pages(self.c, bundle('dev/chess24', {'index.html': b'y'}))
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+
+# ---------------------------------------------------------------------------
+# Republish (destructive)
+# ---------------------------------------------------------------------------
+
+class RepublishTests(PagesTestBase):
     def setUp(self):
         super().setUp()
         self.org = make_org('a')
         self.c = key_client(self.org)
 
-    def test_status_404_when_never_published(self):
-        publish(self.c, 'site', site_files())
-        resp = self.c.get('/api/publish/site')
+    def test_republish_replaces_destructively(self):
+        post_pages(self.c, bundle('dev/chess24', {
+            'index.html': b'v1', 'old.html': b'old',
+        }))
+        resp = post_pages(self.c, bundle('dev/chess24', {'index.html': b'v2'}))
+        self.assertEqual(resp.status_code, 201)
+
+        d = served_dir('a', 'dev/chess24')
+        with open(os.path.join(d, 'index.html'), 'rb') as fh:
+            self.assertEqual(fh.read(), b'v2')
+        self.assertFalse(os.path.exists(os.path.join(d, 'old.html')))
+        # Exactly one Page row for the path.
+        self.assertEqual(
+            Page.objects.filter(organisation=self.org, path='dev/chess24').count(), 1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# List & detail
+# ---------------------------------------------------------------------------
+
+class ListDetailTests(PagesTestBase):
+    def setUp(self):
+        super().setUp()
+        self.org = make_org('a')
+        self.c = key_client(self.org)
+
+    def test_list_returns_live_pages(self):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
+        post_pages(self.c, bundle('prod/site', {'index.html': b'x'}))
+        resp = self.c.get('/api/pages')
+        self.assertEqual(resp.status_code, 200)
+        paths = {row['path'] for row in resp.data}
+        self.assertEqual(paths, {'dev/chess24', 'prod/site'})
+        self.assertTrue(all(row['published_by'] == 'service' for row in resp.data))
+
+    def test_detail_metadata(self):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
+        resp = self.c.get('/api/pages/dev/chess24')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['path'], 'dev/chess24')
+        self.assertEqual(resp.data['url'], '/pages/a/dev/chess24/')
+
+    def test_detail_404_when_not_published(self):
+        resp = self.c.get('/api/pages/dev/nope')
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.data['detail'], 'not currently published')
 
-    def test_publish_is_latest_only_and_lagging(self):
-        # publish v1, then upload v2 (do NOT re-publish) → status still v1.
-        publish(self.c, 'site', site_files(body=b'v1'))
-        self.c.post('/api/publish/site')
-        publish(self.c, 'site', site_files(body=b'v2'))
 
-        resp = self.c.get('/api/publish/site')
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data['version'], 1)
-        # Served bytes are still v1's.
-        with open(os.path.join(served_dir('a', 'site'), 'index.html'), 'rb') as fh:
-            self.assertEqual(fh.read(), b'v1')
-
-    def test_republish_replaces_destructively(self):
-        publish(self.c, 'site', site_files(body=b'v1', extra={'public/old.html': b'old'}))
-        self.c.post('/api/publish/site')
-        publish(self.c, 'site', site_files(body=b'v2'))     # no old.html this time
-        resp = self.c.post('/api/publish/site')
-        self.assertEqual(resp.data['version'], 2)
-
-        d = served_dir('a', 'site')
-        with open(os.path.join(d, 'index.html'), 'rb') as fh:
-            self.assertEqual(fh.read(), b'v2')
-        # The previously-served file is gone (destructive wipe).
-        self.assertFalse(os.path.exists(os.path.join(d, 'old.html')))
-
+# ---------------------------------------------------------------------------
+# Unpublish
+# ---------------------------------------------------------------------------
 
 class UnpublishTests(PagesTestBase):
     def setUp(self):
         super().setUp()
         self.org = make_org('a')
         self.c = key_client(self.org)
-        publish(self.c, 'site', site_files())
-        self.c.post('/api/publish/site')
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
 
-    def test_unpublish_removes_files_and_status(self):
-        resp = self.c.delete('/api/publish/site')
+    def test_unpublish_removes_files_row_and_status(self):
+        resp = self.c.delete('/api/pages/dev/chess24')
         self.assertEqual(resp.status_code, 204)
-        self.assertFalse(os.path.exists(served_dir('a', 'site')))
-        self.assertEqual(self.c.get('/api/publish/site').status_code, 404)
+        self.assertFalse(os.path.exists(served_dir('a', 'dev/chess24')))
+        self.assertFalse(Page.objects.filter(path='dev/chess24').exists())
+        self.assertEqual(self.c.get('/api/pages/dev/chess24').status_code, 404)
 
-    def test_unpublish_records_event(self):
-        self.c.delete('/api/publish/site')
-        last = PagePublication.objects.filter(package__name='site').first()
-        self.assertEqual(last.action, 'unpublish')
+    def test_unpublish_absent_path_404(self):
+        self.c.delete('/api/pages/dev/chess24')
+        resp = self.c.delete('/api/pages/dev/chess24')   # again
+        self.assertEqual(resp.status_code, 404)
 
 
-class HistoryTests(PagesTestBase):
+# ---------------------------------------------------------------------------
+# Audit log — written, but not exposed via API
+# ---------------------------------------------------------------------------
+
+class AuditLogTests(PagesTestBase):
     def setUp(self):
         super().setUp()
         self.org = make_org('a')
         self.c = key_client(self.org)
 
-    def test_history_log_newest_first(self):
-        publish(self.c, 'site', site_files())
-        self.c.post('/api/publish/site')      # publish v1
-        self.c.delete('/api/publish/site')    # unpublish
-        publish(self.c, 'site', site_files()) # v2
-        self.c.post('/api/publish/site')      # publish v2
-
-        resp = self.c.get('/api/publish/site/history')
-        self.assertEqual(resp.status_code, 200)
-        actions = [(r['action'], r['version']) for r in resp.data]
-        self.assertEqual(actions, [('publish', 2), ('unpublish', 1), ('publish', 1)])
-        # Service key → principal 'service'.
-        self.assertTrue(all(r['principal'] == 'service' for r in resp.data))
-
-
-class TombstoneTakedownTests(PagesTestBase):
-    def setUp(self):
-        super().setUp()
-        self.org = make_org('a')
-        self.c = key_client(self.org)
-
-    def test_published_version_tombstone_takes_page_down(self):
-        publish(self.c, 'site', site_files())
-        self.c.post('/api/publish/site')
-        self.assertTrue(os.path.exists(served_dir('a', 'site')))
-
-        self.c.delete('/api/packages/site/versions/1',
-                      data='{"reason":"leak"}', content_type='application/json')
-
-        self.assertFalse(os.path.exists(served_dir('a', 'site')))
-        self.assertEqual(self.c.get('/api/publish/site').status_code, 404)
-        last = PagePublication.objects.filter(package__name='site').first()
-        self.assertEqual(last.action, 'unpublish')
-        self.assertEqual(last.reason, 'tombstoned')
-
-    def test_false_negative_guard_published_non_head_version(self):
-        # publish v1, upload v2 (head), tombstone v1 (the LIVE, non-head one).
-        publish(self.c, 'site', site_files(body=b'v1'))
-        self.c.post('/api/publish/site')          # live = v1
-        publish(self.c, 'site', site_files(body=b'v2'))   # head = v2, live still v1
-
-        self.c.delete('/api/packages/site/versions/1')
-
-        # The old was_latest check would have MISSED this. v7 must take it down.
-        self.assertFalse(os.path.exists(served_dir('a', 'site')))
-        self.assertEqual(self.c.get('/api/publish/site').status_code, 404)
-
-    def test_false_positive_guard_non_published_head(self):
-        # publish v1, upload v2 (never published), tombstone v2 (the head).
-        publish(self.c, 'site', site_files(body=b'v1'))
-        self.c.post('/api/publish/site')          # live = v1
-        publish(self.c, 'site', site_files(body=b'v2'))   # head = v2, unpublished
-
-        self.c.delete('/api/packages/site/versions/2')
-
-        # The old was_latest check would have SPURIOUSLY wiped. v7 leaves v1 up.
-        self.assertTrue(os.path.exists(served_dir('a', 'site')))
-        status = self.c.get('/api/publish/site')
-        self.assertEqual(status.status_code, 200)
-        self.assertEqual(status.data['version'], 1)
-        # No unpublish event written.
-        self.assertFalse(
-            PagePublication.objects.filter(package__name='site', action='unpublish').exists()
+    def test_log_written_publish_then_unpublish(self):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
+        self.c.delete('/api/pages/dev/chess24')
+        rows = list(
+            PagePublication.objects
+            .filter(organisation=self.org, path='dev/chess24')
+            .values_list('action', flat=True)
         )
+        # ordering = ['-at'] → newest first.
+        self.assertEqual(rows, ['unpublish', 'publish'])
 
-    def test_whole_package_delete_takes_page_down(self):
-        publish(self.c, 'site', site_files())
-        self.c.post('/api/publish/site')
-        self.c.delete('/api/packages/site')
-        self.assertFalse(os.path.exists(served_dir('a', 'site')))
+    def test_no_history_endpoint(self):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
+        # There is no /history route in v8; the path captures literally and
+        # resolves to a (non-existent) page named 'dev/chess24/history'.
+        resp = self.c.get('/api/pages/dev/chess24/history')
+        self.assertEqual(resp.status_code, 404)
 
 
-class CrossOrgPagesTests(PagesTestBase):
+# ---------------------------------------------------------------------------
+# Cross-org isolation
+# ---------------------------------------------------------------------------
+
+class CrossOrgTests(PagesTestBase):
     def setUp(self):
         super().setUp()
         self.a = key_client(make_org('a'))
         self.b = key_client(make_org('b'))
-        publish(self.a, 'site', site_files())
-        self.a.post('/api/publish/site')
+        post_pages(self.a, bundle('dev/chess24', {'index.html': b'A'}))
 
-    def test_other_org_cannot_publish_or_read(self):
-        self.assertEqual(self.b.post('/api/publish/site').status_code, 404)
-        self.assertEqual(self.b.get('/api/publish/site').status_code, 404)
-        self.assertEqual(self.b.delete('/api/publish/site').status_code, 404)
-        self.assertEqual(self.b.get('/api/publish/site/history').status_code, 404)
+    def test_other_org_cannot_read_or_delete(self):
+        self.assertEqual(self.b.get('/api/pages/dev/chess24').status_code, 404)
+        self.assertEqual(self.b.delete('/api/pages/dev/chess24').status_code, 404)
+        self.assertEqual(self.b.get('/api/pages').data, [])
 
+    def test_same_path_two_orgs_no_collision(self):
+        resp = post_pages(self.b, bundle('dev/chess24', {'index.html': b'B'}))
+        self.assertEqual(resp.status_code, 201, resp.data)
+        with open(os.path.join(served_dir('a', 'dev/chess24'), 'index.html'), 'rb') as fh:
+            self.assertEqual(fh.read(), b'A')
+        with open(os.path.join(served_dir('b', 'dev/chess24'), 'index.html'), 'rb') as fh:
+            self.assertEqual(fh.read(), b'B')
+
+
+# ---------------------------------------------------------------------------
+# zip-slip
+# ---------------------------------------------------------------------------
 
 class ZipSlipTests(PagesTestBase):
     def setUp(self):
@@ -255,17 +306,40 @@ class ZipSlipTests(PagesTestBase):
         self.c = key_client(self.org)
 
     def test_zip_slip_member_does_not_escape(self):
-        # A member that tries to traverse out of the served dir is skipped.
-        evil = {
-            'package.toml': package_toml(name='evil', author='a'),
-            'public/index.html': b'ok',
-            'public/../../escape.html': b'pwned',
-        }
-        publish(self.c, 'evil', evil)
-        resp = self.c.post('/api/publish/evil')
-        self.assertEqual(resp.status_code, 200, resp.data)
-        # The traversal target must not have been written anywhere outside.
+        resp = post_pages(self.c, bundle('dev/chess24', {
+            'index.html': b'ok',
+            '../../escape.html': b'pwned',
+        }))
+        self.assertEqual(resp.status_code, 201, resp.data)
         escaped = os.path.join(settings.PAGES_ROOT, 'escape.html')
         self.assertFalse(os.path.exists(escaped))
-        # The legitimate file is served.
-        self.assertTrue(os.path.isfile(os.path.join(served_dir('a', 'evil'), 'index.html')))
+        self.assertTrue(
+            os.path.isfile(os.path.join(served_dir('a', 'dev/chess24'), 'index.html'))
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decoupling regression — packages never touch pages
+# ---------------------------------------------------------------------------
+
+class DecouplingTests(PagesTestBase):
+    def setUp(self):
+        super().setUp()
+        self.org = make_org('a')
+        self.c = key_client(self.org)
+
+    def test_package_tombstone_and_delete_leave_page_untouched(self):
+        post_pages(self.c, bundle('dev/chess24', {'index.html': b'x'}))
+        # An unrelated package + version, then tombstone the version and
+        # delete the whole package.
+        upload_package(self.c, 'pkg', {'package.toml': package_toml(name='pkg', author='a')})
+        self.assertEqual(self.c.delete('/api/packages/pkg/versions/1').status_code, 200)
+        self.assertEqual(self.c.delete('/api/packages/pkg').status_code, 204)
+
+        # The page is completely untouched: still served, still live, and no
+        # unpublish event was written.
+        self.assertTrue(os.path.exists(served_dir('a', 'dev/chess24')))
+        self.assertEqual(self.c.get('/api/pages/dev/chess24').status_code, 200)
+        self.assertFalse(
+            PagePublication.objects.filter(action='unpublish').exists()
+        )
