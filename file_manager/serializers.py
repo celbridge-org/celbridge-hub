@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Package, PackageAlias, PackageVersion, PagePublication
+from .models import Package, PackageAlias, PackageVersion, Page
 
 
 class PackageVersionSerializer(serializers.ModelSerializer):
@@ -92,17 +92,20 @@ class PackageDetailSerializer(serializers.ModelSerializer):
         return PackageAliasSerializer(qs, many=True).data
 
 
-class PagePublicationSerializer(serializers.ModelSerializer):
-    version = serializers.IntegerField(source='version.version', read_only=True)
-    principal = serializers.SerializerMethodField()
-    at = serializers.SerializerMethodField()
+class PageSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+    published_at = serializers.SerializerMethodField()
+    published_by = serializers.SerializerMethodField()
 
     class Meta:
-        model = PagePublication
-        fields = ['action', 'version', 'at', 'principal', 'reason']
+        model = Page
+        fields = ['path', 'url', 'published_at', 'published_by', 'content_hash']
 
-    def get_at(self, obj):
-        return obj.at.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def get_url(self, obj):
+        return f'/pages/{obj.organisation.slug}/{obj.path}/'
 
-    def get_principal(self, obj):
+    def get_published_at(self, obj):
+        return obj.published_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def get_published_by(self, obj):
         return obj.published_by.get_username() if obj.published_by else 'service'

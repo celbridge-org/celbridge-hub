@@ -6,8 +6,9 @@ needed, scoped to the caller's organisation), regenerates `HISTORY.md`
 from the DB, stamps the assigned version into the embedded
 `package.toml`, repackages the ZIP, and upserts the `latest` alias.
 
-Publishing of a package's `public/` folder is a separate, explicit
-action handled by `pages.py` — uploads no longer publish anything.
+Packages have nothing to do with publishing pages (decoupled in v8) —
+uploads never publish anything. Pages are a standalone ZIP-upload feature
+in `pages.py`.
 """
 from __future__ import annotations
 

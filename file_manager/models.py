@@ -184,23 +184,56 @@ class PackageAlias(models.Model):
         return f'{self.package.name}@{self.name} → v{self.version.version}'
 
 
-class PagePublication(models.Model):
-    """Append-only log of page publish/unpublish events.
+def page_zip_upload_to(instance, filename):
+    # `path` may be multi-segment; slashes become real subdirectories.
+    return f'page_bundles/{instance.organisation.slug}/{instance.path}.zip'
 
-    The *current* published state for a package is derived: the live
-    version is the `version` of the package's most recent
-    `PagePublication` iff that row's `action == 'publish'`.
+
+class Page(models.Model):
+    """The current live state of one published path.
+
+    A page is published from its own ZIP upload (decoupled from packages
+    in v8). This row is the source of truth for what is served, for the
+    prefix-overlap check, and for the `GET /api/pages` listing. The
+    served path comes from the ZIP's `pages.toml` `[publish].path`.
     """
-    package = models.ForeignKey(
-        Package,
-        on_delete=models.CASCADE,
-        related_name='page_publications',
+    organisation = models.ForeignKey(
+        Organisation,
+        on_delete=models.PROTECT,
+        related_name='pages',
     )
-    version = models.ForeignKey(
-        PackageVersion,
+    path = models.CharField(max_length=255)
+    zip_file = models.FileField(upload_to=page_zip_upload_to)
+    content_hash = models.CharField(max_length=80, blank=True)
+    published_at = models.DateTimeField(auto_now=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='pages',
+    )
+
+    class Meta:
+        unique_together = ('organisation', 'path')
+
+    def __str__(self):
+        return f'{self.organisation.slug}/{self.path}'
+
+
+class PagePublication(models.Model):
+    """Append-only audit log of page publish/unpublish events.
+
+    Keyed on `(organisation, path)` — no FK to `Page`, so the history
+    survives an unpublish. There is no API read surface in v8; this log
+    is inspected via Django admin only.
+    """
+    organisation = models.ForeignKey(
+        Organisation,
         on_delete=models.PROTECT,
         related_name='page_publications',
     )
+    path = models.CharField(max_length=255)
     action = models.CharField(
         max_length=10,
         choices=[('publish', 'publish'), ('unpublish', 'unpublish')],
@@ -213,10 +246,11 @@ class PagePublication(models.Model):
         blank=True,
         related_name='page_publications',
     )
+    content_hash = models.CharField(max_length=80, blank=True)
     reason = models.TextField(blank=True)
 
     class Meta:
         ordering = ['-at']
 
     def __str__(self):
-        return f'{self.package.name} {self.action} v{self.version.version}'
+        return f'{self.organisation.slug}/{self.path} {self.action}'
