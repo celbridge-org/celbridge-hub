@@ -81,19 +81,19 @@ class VersionHistoryEndpointTests(TestCase):
             )
 
     def test_returns_text_markdown_for_existing_version(self):
-        resp = APIClient().get('/api/packages/demo/versions/2/history')
+        resp = self.client.get('/api/packages/demo/versions/2/history')
         self.assertEqual(resp.status_code, 200)
         self.assertIn('text/markdown', resp['Content-Type'])
         self.assertIn(b'# Package History: demo', resp.content)
 
     def test_truncates_at_requested_version(self):
-        resp = APIClient().get('/api/packages/demo/versions/2/history')
+        resp = self.client.get('/api/packages/demo/versions/2/history')
         self.assertIn(b'### Version 2', resp.content)
         self.assertIn(b'### Version 1', resp.content)
         self.assertNotIn(b'### Version 3', resp.content)
 
     def test_includes_hash_for_requested_version(self):
-        resp = APIClient().get('/api/packages/demo/versions/1/history')
+        resp = self.client.get('/api/packages/demo/versions/1/history')
         v1 = PackageVersion.objects.get(package__name='demo', version=1)
         self.assertTrue(v1.content_hash.startswith('sha256:'))
         self.assertIn(v1.content_hash.encode('utf-8'), resp.content)
@@ -105,22 +105,22 @@ class VersionHistoryEndpointTests(TestCase):
             data=json.dumps({'version': 2}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/demo/versions/3/history')
+        resp = self.client.get('/api/packages/demo/versions/3/history')
         self.assertNotIn(b'## Aliases', resp.content)
         self.assertNotIn(b'| latest |', resp.content)
         self.assertNotIn(b'| stable |', resp.content)
 
     def test_unknown_package_returns_404(self):
-        resp = APIClient().get('/api/packages/no-such/versions/1/history')
+        resp = self.client.get('/api/packages/no-such/versions/1/history')
         self.assertEqual(resp.status_code, 404)
 
     def test_unknown_version_returns_404(self):
-        resp = APIClient().get('/api/packages/demo/versions/99/history')
+        resp = self.client.get('/api/packages/demo/versions/99/history')
         self.assertEqual(resp.status_code, 404)
 
     def test_history_endpoint_unchanged_for_head(self):
-        head = APIClient().get('/api/packages/demo/history').content
-        explicit = APIClient().get('/api/packages/demo/versions/3/history').content
+        head = self.client.get('/api/packages/demo/history').content
+        explicit = self.client.get('/api/packages/demo/versions/3/history').content
         self.assertEqual(head, explicit)
 
 
@@ -135,7 +135,7 @@ class VersionHistoryTombstoneTests(TestCase):
             data=json.dumps({'reason': 'oops'}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/demo/versions/1/history')
+        resp = self.client.get('/api/packages/demo/versions/1/history')
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b'### Version 1 (tombstoned)', resp.content)
         self.assertIn(b'- **Tombstoned:** oops', resp.content)
@@ -152,7 +152,7 @@ class VersionHistoryTombstoneTests(TestCase):
             data=json.dumps({'reason': 'bad build'}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/demo/versions/3/history')
+        resp = self.client.get('/api/packages/demo/versions/3/history')
         self.assertEqual(resp.status_code, 200)
         body = resp.content
         self.assertIn(b'### Version 3', body)
@@ -185,7 +185,7 @@ class VersionHistoryForkChainTests(TestCase):
         # ancestor chain is rendered fully.
         publish(client, 'child', {'package.toml': package_toml(name='child', author='chris')})
 
-        resp = APIClient().get('/api/packages/child/versions/1/history')
+        resp = client.get('/api/packages/child/versions/1/history')
         self.assertEqual(resp.status_code, 200)
         body = resp.content
         # child v2 must NOT appear (truncated).

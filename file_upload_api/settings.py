@@ -95,9 +95,13 @@ DATABASES = {
 
 # REST Framework settings
 REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'file_manager.auth.ApiKeyAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticatedOrReadOnly',
-    ]
+        'file_manager.permissions.HasOrganisation',
+    ],
 }
 
 # Password validation
@@ -121,9 +125,9 @@ AUTH_PASSWORD_VALIDATORS = [
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-PUBLIC_URL = '/public/'
-PUBLIC_ROOT = os.path.join(BASE_DIR, 'media', 'public')
-os.makedirs(PUBLIC_ROOT, exist_ok=True)
+PAGES_URL = '/pages/'
+PAGES_ROOT = os.path.join(BASE_DIR, 'media', 'pages')
+os.makedirs(PAGES_ROOT, exist_ok=True)
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/

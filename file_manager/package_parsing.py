@@ -1,9 +1,13 @@
 """Parsing and validation for uploaded package ZIPs.
 
 A package is a ZIP that must contain `package.toml` at its root with a
-`[package]` table declaring at least `name`, `type`, and `author`. The
-parser also surfaces the embedded `history.md` (if any) so the upload
-pipeline can do fork detection on new package names.
+`[package]` table declaring at least `name` and `author`. The parser
+also surfaces the embedded `history.md` (if any) so the upload pipeline
+can do fork detection on new package names.
+
+As of v7 there are no package *types* — a package is a package. A
+manifest may still carry a `[package].type` field; it is parsed and
+silently ignored.
 """
 from __future__ import annotations
 
@@ -13,9 +17,6 @@ import zipfile
 from dataclasses import dataclass
 
 
-VALID_TYPES = ('mod', 'project', 'page')
-
-
 class PackageValidationError(Exception):
     """Raised when an uploaded ZIP fails package.toml validation."""
 
@@ -23,7 +24,6 @@ class PackageValidationError(Exception):
 @dataclass(frozen=True)
 class ParsedPackage:
     name: str
-    type: str
     author: str
     history_md: str | None  # raw text of history.md if present, else None
 
@@ -74,22 +74,10 @@ def parse_package_zip(zip_path_or_file) -> ParsedPackage:
                 "invalid package - missing `[package] 'name' property` in package.toml` file"
             )
 
-        type_ = package_table.get('type')
-        if not type_:
-            raise PackageValidationError(
-                "invalid package - missing `[package] 'type' property` in package.toml` file"
-            )
-
         author = package_table.get('author')
         if not author:
             raise PackageValidationError(
                 "invalid package - missing `[package] 'author' property` in package.toml` file"
-            )
-
-        if type_ not in VALID_TYPES:
-            raise PackageValidationError(
-                "invalid package - `[package] 'type'` property in `package.toml`"
-                ' file must be one of "mod", "project", or "page"'
             )
 
         history_bytes = _read_member(zf, 'history.md')
@@ -97,7 +85,6 @@ def parse_package_zip(zip_path_or_file) -> ParsedPackage:
 
     return ParsedPackage(
         name=str(name).strip(),
-        type=str(type_).strip(),
         author=str(author).strip(),
         history_md=history_md,
     )
