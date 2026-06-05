@@ -74,6 +74,22 @@ python manage.py bootstrap_org --name "Acme" --slug acme --label "ci key"
 Optionally attach a human user (so session/admin logins resolve to the
 org): add `--user alice --password secret`.
 
+### Issue additional keys for an existing org
+
+To mint more keys for an org that already exists, use `issue_api_key`:
+
+```bash
+# Service key (machine/CI — no human principal)
+python manage.py issue_api_key --org acme --label "ci key"
+
+# Per-user key (the user must already be a member of the org)
+python manage.py issue_api_key --org acme --user alice --label "alice laptop"
+```
+
+It prints the plaintext key once. (You can also add keys from the Django
+admin under **Api keys → Add**.) Revoke a key by setting its `revoked_at`
+in admin — revoked keys get `401`.
+
 ### Run the server
 
 ```bash

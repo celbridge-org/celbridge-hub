@@ -7,7 +7,10 @@ per org).
 """
 from __future__ import annotations
 
+import io
+
 from django.contrib.auth.models import User
+from django.core.management import CommandError, call_command
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -163,6 +166,55 @@ class ForkScopingTests(TestCase):
         )
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertIsNone(resp.data['forked_from'])
+
+
+class IssueApiKeyCommandTests(TestCase):
+    def setUp(self):
+        self.org = make_org('a')
+
+    def _run(self, **kwargs):
+        out = io.StringIO()
+        call_command('issue_api_key', stdout=out, **kwargs)
+        return out.getvalue()
+
+    def _key_from_output(self, output):
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith('kpf_'):
+                return line
+        raise AssertionError(f'no key in output:\n{output}')
+
+    def test_issues_service_key_that_authenticates(self):
+        output = self._run(org='a', label='ci')
+        self.assertEqual(ApiKey.objects.filter(organisation=self.org).count(), 1)
+        key = ApiKey.objects.get(organisation=self.org)
+        self.assertIsNone(key.user)
+
+        plaintext = self._key_from_output(output)
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION=f'Api-Key {plaintext}')
+        self.assertEqual(c.get('/api/packages').status_code, 200)
+
+    def test_issues_per_user_key_for_member(self):
+        user = User.objects.create_user(username='alice', password='p')
+        Membership.objects.create(user=user, organisation=self.org)
+        self._run(org='a', user='alice', label='laptop')
+        key = ApiKey.objects.get(organisation=self.org)
+        self.assertEqual(key.user, user)
+
+    def test_unknown_org_errors(self):
+        with self.assertRaises(CommandError):
+            self._run(org='nope', label='x')
+
+    def test_unknown_user_errors(self):
+        with self.assertRaises(CommandError):
+            self._run(org='a', user='ghost', label='x')
+
+    def test_non_member_user_rejected(self):
+        # A user who exists but is not a member of the org cannot get a key.
+        User.objects.create_user(username='outsider', password='p')
+        with self.assertRaises(CommandError):
+            self._run(org='a', user='outsider', label='x')
 
 
 class SessionMembershipTests(TestCase):
