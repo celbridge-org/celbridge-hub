@@ -149,6 +149,22 @@ URL — which is exactly the URL the publish API returns).
     ```
   - Unauthenticated requests should now return `401`.
 
+### 12. Force HTTPS (do this — it protects the API key in transit)
+
+The API key is sent in the `Authorization: Api-Key …` header on **every**
+request. Over plain `http://` that header (and all data) travels in
+**cleartext**; over `https://` the whole request is TLS-encrypted.
+`*.pythonanywhere.com` has a valid HTTPS certificate out of the box, but
+plain HTTP is also reachable by default — so close that hole:
+
+  - Web tab → scroll to **Security** → tick **Force HTTPS** → **Reload**.
+  - This redirects any `http://` request to `https://`, so a client can
+    never accidentally send the key in cleartext.
+  - Make sure your API client always uses `https://…` URLs.
+
+(The key is also stored only as a salted hash in the DB — never in
+plaintext — which is why `bootstrap_org` / `issue_api_key` show it once.)
+
 
 # (2) If for a NEW installation
 
@@ -340,6 +356,12 @@ NOTE: not sure about typoes - but for me 'AnTulcha' had to be same caps-case as 
 
 ## Reload web app
 Hit the green Reload button on the Web tab.
+
+## Force HTTPS
+On the Web tab → **Security** → tick **Force HTTPS** → Reload. This keeps
+the API key (sent in the `Authorization` header on every request) from
+ever travelling in cleartext over plain `http://`. Always use `https://`
+URLs in your client. See section (1b) step 12 for the full rationale.
 
 
 hopefully it all now works:
