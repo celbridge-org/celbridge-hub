@@ -3,194 +3,264 @@
 
 Prototype of a simple package repository server for the Celbridge Workbench application
 
+A Django REST API for publishing, versioning, and serving **packages**,
+with per-organisation isolation and a static-site **pages** publishing
+feature.
+
+> **Version 7 (current).** v7 is a breaking, clean-start release:
+> per-organisation isolation, API-key authentication on every endpoint
+> (no anonymous access), package types removed, and a new `pages`
+> publish feature. See `TDDs/project_design_version07.md` and
+> `TDDs/version07_implementation_plan.md` for the full design.
+
+
+
 NOTE:
 - a Python client compatable with this API server can be found at: https://github.com/celbridge-org/celbridge-hub-api-client
 
+
 ## Overview
 
-This celbridge-hub project includes a single app, file_manager, which implements the following features:
+The project is a single Django app, `file_manager`, exposing a REST API
+under `/api/`. The core concepts:
 
-- Upload Files: Accept file uploads via a POST endpoint.
+- **Organisation** — the tenant boundary. Every package, author, and API
+  key belongs to exactly one organisation. A caller authenticated for
+  org *A* can only see and act on org *A*'s data, and never learns that
+  org *B* exists.
+- **Package** — a named, privately-stored artifact. A package is a
+  package; there are no longer any package *types*. Uploads of an
+  existing name become the next version automatically.
+- **Version** — each upload is an immutable, hashed ZIP. Versions are
+  never hard-deleted; they are **tombstoned** (the row and history
+  survive, the bytes are removed).
+- **Author** — taken from the uploaded `package.toml`, scoped per
+  organisation.
+- **Alias** — named pointers to versions. `latest` is managed
+  automatically; you may set your own (e.g. `stable`).
+- **Pages** — a package version's `public/` folder can be explicitly
+  published to a world-readable URL at `/pages/<org-slug>/<name>/`.
 
-- List Files: Retrieve a list of all uploaded files with metadata.
-
-- Retrieve Files: Download specific files by ID.
-
-- Delete Files: Remove files and their metadata by ID.
-
-- Files are stored in the MEDIA_ROOT directory, organized by date (uploads/YYYY/MM/DD/).
-
-The API is built using Django REST Framework.
-
-
+Every `/api/` endpoint requires authentication (an API key or an
+org-member session). **There is no anonymous access.** The only
+unauthenticated surface is the published static `/pages/...` output.
 
 ## Requirements
 
-- Python 3.x
-- Django
-- Django REST Framework
+- Python 3.11+ (uses `tomllib`)
+- Django + Django REST Framework (see `requirements.txt`)
 
-## Setup Instructions
+## Setup
 
-```
-## Clone the repo
+```bash
+# Clone
+git clone https://github.com/celbridge-org/celbridge-hub.git
+cd celbridge-hub
 
-git clone https://github.com/celbridge-org/celbridge-hub
-cd django-file_upload_API/
-cd file_upload_api
-```
-## Create virtual environment
+# Virtual environment
+python -m venv venv
+source venv/bin/activate
 
-```
-python -m venv env
-source env/bin/activate
-
-```
-## Install dependencies
-
-```
-cd ..
+# Dependencies
 pip install -r requirements.txt
 
-```
-
-## Configuration
-
-Update MEDIA_ROOT and MEDIA_URL in settings.py for file storage.
-
-```
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
-```
-
-## Apply migrations
-```
-python manage.py makemigrations
+# Migrate (clean start — a single 0001_initial)
 python manage.py migrate
-
 ```
 
-## Run the server
+### Bootstrap the first organisation and API key
+
+v7 has no anonymous access, so you need an organisation and a key before
+you can call the API. The `bootstrap_org` command creates both and prints
+the plaintext key **once**:
+
+```bash
+python manage.py bootstrap_org --name "Acme" --slug acme --label "ci key"
+# → API key (shown once — store it now):
+#       kpf_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
+
+Optionally attach a human user (so session/admin logins resolve to the
+org): add `--user alice --password secret`.
+
+### Issue additional keys for an existing org
+
+To mint more keys for an org that already exists, use `issue_api_key`:
+
+```bash
+# Service key (machine/CI — no human principal)
+python manage.py issue_api_key --org acme --label "ci key"
+
+# Per-user key (the user must already be a member of the org)
+python manage.py issue_api_key --org acme --user alice --label "alice laptop"
+```
+
+It prints the plaintext key once. (You can also add keys from the Django
+admin under **Api keys → Add**.) Revoke a key by setting its `revoked_at`
+in admin — revoked keys get `401`.
+
+### Run the server
+
+```bash
 python manage.py runserver
+```
+
+The API is available at http://127.0.0.1:8000. Send the key on every
+request:
 
 ```
-The API will be available at http://127.0.0.1:8000.
+Authorization: Api-Key kpf_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
 
+## Authentication
+
+| Auth method        | How                                                        | Author of uploads        |
+| ------------------ | --------------------------------------------------------- | ------------------------ |
+| Org service key    | `Authorization: Api-Key <key>` (key minted with no user)  | from the manifest        |
+| Per-user key       | `Authorization: Api-Key <key>` (key minted for a user)    | from the manifest        |
+| Session            | logged-in user with a `Membership`                        | from the manifest        |
+
+Any valid org key (service or per-user) has full access to that org's
+data — there is no read/write split and no role enforcement in v7. The
+package version's **author is always taken from `package.toml`**, scoped
+to the caller's organisation.
 
 ## API Endpoints
 
-### v2 — Packages (current)
+All routes are under `/api/` and require an org context.
 
-| Method | Endpoint                                  | Description                                | Auth     |
-| ------ | ----------------------------------------- | ------------------------------------------ | -------- |
-| POST   | `/api/packages/upload/`                   | Upload package (new or new version)        | required |
-| GET    | `/api/packages/`                          | List all packages (latest version each)    | public   |
-| GET    | `/api/packages/<name>/`                   | Package detail + version list              | public   |
-| GET    | `/api/packages/<name>/v<n>/`              | Download a specific version's ZIP          | public   |
-| GET    | `/api/packages/<name>/history/`           | Generated `history.md` as text             | public   |
-| POST   | `/api/packages/<name>/v<n>/tombstone/`    | Tombstone (soft-delete) a version          | required |
+### Packages
 
-Uploaded ZIPs must contain a `package.toml` at the root:
+| Method | Endpoint                                      | Description                              |
+| ------ | --------------------------------------------- | ---------------------------------------- |
+| GET    | `/api/packages`                               | List this org's packages                 |
+| POST   | `/api/packages`                               | Register a new (empty) package           |
+| GET    | `/api/packages/<name>`                        | Package detail (versions + aliases)      |
+| DELETE | `/api/packages/<name>`                        | Cascade-tombstone all versions           |
+| POST   | `/api/packages/<name>/versions`               | Publish a new version (multipart ZIP)    |
+| GET    | `/api/packages/<name>/versions`               | List versions                            |
+| GET    | `/api/packages/<name>/versions/<n>`           | Version metadata                         |
+| DELETE | `/api/packages/<name>/versions/<n>`           | Tombstone a version                      |
+| GET    | `/api/packages/<name>/versions/<n>/download`  | Download a version's ZIP                 |
+| GET    | `/api/packages/<name>/versions/<n>/history`   | `HISTORY.md` rendered as-of version `n`  |
+| GET    | `/api/packages/<name>/latest`                 | Download the latest version's ZIP        |
+| GET    | `/api/packages/<name>/history`                | Generated `HISTORY.md` (full chronology) |
+| GET    | `/api/packages/<name>/aliases`                | List aliases                             |
+| PUT    | `/api/packages/<name>/aliases/<alias>`        | Set/move a user alias to a version       |
+| DELETE | `/api/packages/<name>/aliases/<alias>`        | Remove a user alias                      |
+
+### Pages (publish a package's `public/` folder)
+
+| Method | Endpoint                          | Description                                       |
+| ------ | --------------------------------- | ------------------------------------------------- |
+| POST   | `/api/publish/<name>`             | Publish the **latest** version's `public/` folder |
+| DELETE | `/api/publish/<name>`             | Unpublish (remove the served files)               |
+| GET    | `/api/publish/<name>`             | Current published version + timestamp             |
+| GET    | `/api/publish/<name>/history`     | Full publication log (newest first)               |
+
+### Served static output (public, no auth)
+
+| Method | Endpoint                            | Description                          |
+| ------ | ----------------------------------- | ------------------------------------ |
+| GET    | `/pages/<org-slug>/<name>/...`      | The published `public/` folder       |
+
+## The `package.toml` manifest
+
+Uploaded ZIPs must contain a `package.toml` at the root declaring at
+least `name` and `author`:
 
 ```toml
 [package]
-name    = "tiptap-notes"
-type    = "mod"            # required: "mod", "project", or "app"
-author  = "celbridge"
-license = "MIT"            # ignored in v2
-tags    = ["editor"]       # ignored in v2
+name   = "homepage"
+author = "celbridge"
+# type = "..."   # optional in v7 — parsed and silently ignored
+# version = 1    # ignored — the server stamps the assigned version
 ```
 
 Notes:
-- Uploads of an existing package name become the next version automatically.
-- Any `history.md` inside the uploaded ZIP is replaced with one regenerated
-  from the database (the DB is the source of truth).
-- A new package whose embedded `history.md` references a different existing
-  package's version is recorded as a fork (v1 with a pointer to the
-  ancestor).
-- Packages of `type = "app"` have their latest version extracted to
-  `/public/<name>/`. Packages of type `mod` or `project` are downloadable
-  but not web-published.
-- Tombstoning soft-deletes a version: the row survives (so history is
-  intact), the ZIP is removed, and `GET /api/packages/<name>/v<n>/` returns
-  `410 Gone`. If the tombstoned version was the latest of an `app` package,
-  `/public/<name>/` is wiped.
+- Uploading an existing package name creates the next version
+  automatically (`latest` moves to it).
+- Any `HISTORY.md` inside the uploaded ZIP is replaced with one
+  regenerated from the database (the DB is the source of truth).
+- A new package whose embedded `HISTORY.md` references another existing
+  package **in the same org** is recorded as a fork. Cross-org lineage
+  is not possible.
+- Tombstoning soft-deletes a version: the row and chronology survive,
+  the ZIP is removed, and `download` returns `410 Gone`.
 
-### Deprecated endpoints
+## The pages feature
 
-The pre-v2 file endpoints below remain operational but are deprecated and
-will be removed in v3 or v4. Each response carries `Deprecation: true`,
-`Sunset`, and `Link: <successor>; rel="successor-version"` headers per
-RFC 8594.
-
-| Method | Endpoint                  | Description              |
-| ------ | ------------------------- | ------------------------ |
-| POST   | `/api/upload/`            | Upload a file (deprecated) |
-| GET    | `/api/files/`             | List uploaded files (deprecated) |
-| GET    | `/api/files/<id>/`        | Download a specific file (deprecated) |
-| DELETE | `/api/files/<id>/delete/` | Delete a file by ID (deprecated) |
-
-## Example with cURL
-
-**Upload a File:**
-```
-curl -X POST -F "file=@test.txt" http://127.0.0.1:8000/api/upload/
-```
-Response: JSON with id, file, file_url, uploaded_at, and file_size.
-
-**List Files:**
-```
-curl http://127.0.0.1:8000/api/files/
-```
-Response: Array of file metadata.
-
-**Retrieve a File:**
-```
-curl http://127.0.0.1:8000/api/files/1/ -o downloaded_test.txt
-```
-Downloads the file with ID 1.
-
-**Delete a File:**
+A package version's ZIP may contain a top-level `public/` directory:
 
 ```
-curl -X DELETE http://127.0.0.1:8000/api/files/1/delete/
+homepage.zip
+├── package.toml
+├── src/...            ← private, never served
+└── public/            ← this subtree is what /api/publish exposes
+    ├── index.html
+    └── style.css
 ```
-Response: 204 with no content.
 
-**File Storage**
-- Files are saved in MEDIA_ROOT/uploads/YYYY/MM/DD/.
+`POST /api/publish/homepage` extracts that `public/` subtree (the
+`public/` prefix is stripped) and serves it at
+`/pages/<org-slug>/homepage/`. Key behaviours:
 
-- The file_url in responses points to the downloadable file (e.g., /media/uploads/2025/06/29/test.txt).
+- **Latest-only.** Publish always snapshots the current latest version.
+  Uploading a new version does *not* auto-publish — the live page stays
+  pinned until you publish again. `GET /api/publish/<name>` reports the
+  currently-published version, which can lag the head.
+- **Destructive replace.** Each publish wipes and rewrites the served
+  directory; only one live state per package.
+- **Stored history.** Every publish/unpublish is logged
+  (`GET /api/publish/<name>/history`), even though only the latest is
+  on disk.
+- **Tombstone auto-takedown.** Tombstoning the *currently-published*
+  version immediately removes the served files and logs an `unpublish`
+  (reason `tombstoned`) — a safe "take it down now" reflex.
 
-**Testing**
-The project includes unit tests for all endpoints. To run the tests:
-
-```
-python manage.py test
-```
-- Test Coverage: Tests verify file upload, listing, retrieval, and deletion.
-
-- Requirements: Ensure the test database is created during the first run.
-
-
-## to run webserver
+## Examples with cURL
 
 ```bash
-source venv/bin/activate && python manage.py runserver 8001 
+KEY="kpf_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# List packages
+curl -H "Authorization: Api-Key $KEY" http://127.0.0.1:8000/api/packages
+
+# Publish a new version (multipart ZIP)
+curl -H "Authorization: Api-Key $KEY" \
+     -F "file=@homepage.zip" \
+     http://127.0.0.1:8000/api/packages/homepage/versions
+
+# Publish the latest version's public/ folder as a page
+curl -X POST -H "Authorization: Api-Key $KEY" \
+     http://127.0.0.1:8000/api/publish/homepage
+# → {"package":"homepage","version":1,"published_at":"...","url":"/pages/acme/homepage/"}
+
+# Fetch the served page (no auth)
+curl http://127.0.0.1:8000/pages/acme/homepage/index.html
+
+# Unpublish
+curl -X DELETE -H "Authorization: Api-Key $KEY" \
+     http://127.0.0.1:8000/api/publish/homepage
 ```
 
+## Testing
 
-## to update on Pythonanwhere
+```bash
+python manage.py test
+```
 
-1. git stash (settings.py)
-2. git pull
-3. git stash apply
-4. go do WEB table and restart web server
+Coverage includes the package API, per-organisation isolation
+(`tests_org_isolation.py`), the pages feature (`tests_pages.py`), and
+per-version history (`tests_v6.py`).
 
+## Deploying on PythonAnywhere
 
+1. `git stash` (local `settings.py` changes)
+2. `git pull`
+3. `git stash apply`
+4. Reload the web app from the **Web** tab.
 
-
-
-
-
+> **Clean-start note.** v7 discards all pre-v7 data. On first deploy,
+> remove any old `db.sqlite3` and `media/` tree, run `migrate`, then
+> `bootstrap_org` to mint the first organisation and key.

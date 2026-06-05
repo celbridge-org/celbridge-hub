@@ -1,4 +1,4 @@
-"""HTTP views for the v4 package API.
+"""HTTP views for the v7 package API.
 
 URL conventions:
 - collection endpoints take a method-dispatch view (GET to list, POST to
@@ -6,11 +6,12 @@ URL conventions:
 - per-resource endpoints take their own method-dispatch view (GET for
   metadata, DELETE for tombstone, etc.)
 
-Authentication: reads are public, writes require an authenticated user.
+Authentication: every endpoint requires an organisation context (an API
+key or an org-member session). There is no anonymous access and no
+finer read/write split — see `permissions.HasOrganisation`.
 """
 from __future__ import annotations
 
-import os
 import re
 
 from django.db import transaction
@@ -18,7 +19,6 @@ from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -26,26 +26,49 @@ from .history import render_history
 from .models import (
     Package,
     PackageAlias,
-    PackageType,
     PackageVersion,
     SiteConfiguration,
 )
-from .package_parsing import VALID_TYPES, PackageValidationError
+from .package_parsing import PackageValidationError
 from .package_pipeline import (
     PackagePipelineError,
     process_upload,
-    wipe_public,
 )
+from .pages import (
+    NoPublicFolderError,
+    current_publication,
+    page_url,
+    publish_latest,
+    unpublish,
+)
+from .permissions import resolve_org
 from .serializers import (
     PackageAliasSerializer,
     PackageDetailSerializer,
     PackageListItemSerializer,
     PackageVersionSerializer,
+    PagePublicationSerializer,
 )
 
 
 _ALIAS_NAME_RE = re.compile(r'^[a-z][a-z0-9-]*$')
 _RESERVED_ALIAS = 'latest'
+
+
+class OrgScopedView(APIView):
+    """Base view exposing the caller's organisation and a scoped lookup.
+
+    Every package/version query in this module routes through `self.org`
+    (directly or via `package__organisation`) so cross-org data is never
+    reachable.
+    """
+
+    @property
+    def org(self):
+        return resolve_org(self.request)
+
+    def get_package(self, name):
+        return get_object_or_404(Package, organisation=self.org, name=name)
 
 
 def _set_latest(package: Package, version: PackageVersion) -> None:
@@ -72,19 +95,13 @@ def _move_or_drop_latest(package: Package) -> None:
 
 
 def _tombstone_version(version_obj: PackageVersion, reason: str) -> bool:
-    """Tombstone one version, cascading aliases. Returns True if it was
+    """Tombstone one version, cascading aliases and (if this is the
+    currently-published version) the live page. Returns True if it was
     not already tombstoned."""
     if version_obj.is_tombstoned:
         return False
 
     package = version_obj.package
-    was_latest = (
-        PackageVersion.objects
-        .filter(package=package)
-        .order_by('-version')
-        .first()
-        .id == version_obj.id
-    )
 
     if version_obj.zip_file:
         try:
@@ -104,8 +121,13 @@ def _tombstone_version(version_obj: PackageVersion, reason: str) -> bool:
     ).exists():
         _move_or_drop_latest(package)
 
-    if was_latest and package.package_type.name == 'page':
-        wipe_public(package.name)
+    # Page takedown: only when the tombstoned version is the one currently
+    # published — NOT merely the head. A tombstone is a "take it down now"
+    # action; keying on the live version (which can lag the head) is the
+    # correct trigger.
+    pub = current_publication(package)
+    if pub is not None and pub.version_id == version_obj.id:
+        unpublish(package, reason='tombstoned')
 
     return True
 
@@ -114,16 +136,11 @@ def _tombstone_version(version_obj: PackageVersion, reason: str) -> bool:
 # /api/packages
 # ---------------------------------------------------------------------------
 
-class PackagesView(APIView):
+class PackagesView(OrgScopedView):
     """GET — list packages. POST — register a new (empty) package."""
 
-    def get_permissions(self):
-        if self.request.method == 'POST':
-            return [IsAuthenticated()]
-        return [AllowAny()]
-
     def get(self, request):
-        qs = Package.objects.select_related('package_type').order_by('name')
+        qs = Package.objects.filter(organisation=self.org).order_by('name')
         return Response(PackageListItemSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -132,7 +149,7 @@ class PackagesView(APIView):
                 {'detail': 'body must be a JSON object'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        unknown = set(request.data.keys()) - {'name', 'type'}
+        unknown = set(request.data.keys()) - {'name'}
         if unknown:
             return Response(
                 {'detail': f"unexpected fields: {sorted(unknown)}"},
@@ -140,43 +157,19 @@ class PackagesView(APIView):
             )
 
         name = (request.data.get('name') or '').strip()
-        type_ = (request.data.get('type') or '').strip()
-
         if not name:
             return Response(
                 {'detail': "missing 'name'"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not type_:
-            return Response(
-                {'detail': "missing 'type'"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if type_ not in VALID_TYPES:
-            return Response(
-                {
-                    'detail': (
-                        '`type` must be one of "mod", "project", or "page"'
-                    ),
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
-        if Package.objects.filter(name=name).exists():
+        if Package.objects.filter(organisation=self.org, name=name).exists():
             return Response(
                 {'detail': f"package '{name}' already exists"},
                 status=status.HTTP_409_CONFLICT,
             )
 
-        try:
-            package_type = PackageType.objects.get(name=type_)
-        except PackageType.DoesNotExist:
-            return Response(
-                {'detail': f"package type '{type_}' is not configured"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        package = Package.objects.create(name=name, package_type=package_type)
+        package = Package.objects.create(organisation=self.org, name=name)
         return Response(
             PackageDetailSerializer(package).data,
             status=status.HTTP_201_CREATED,
@@ -187,24 +180,15 @@ class PackagesView(APIView):
 # /api/packages/<name>
 # ---------------------------------------------------------------------------
 
-class PackageView(APIView):
+class PackageView(OrgScopedView):
     """GET — metadata. DELETE — cascade-tombstone all versions."""
 
-    def get_permissions(self):
-        if self.request.method == 'DELETE':
-            return [IsAuthenticated()]
-        return [AllowAny()]
-
     def get(self, request, name):
-        package = get_object_or_404(
-            Package.objects.select_related('package_type'), name=name,
-        )
+        package = self.get_package(name)
         return Response(PackageDetailSerializer(package).data)
 
     def delete(self, request, name):
-        package = get_object_or_404(
-            Package.objects.select_related('package_type'), name=name,
-        )
+        package = self.get_package(name)
 
         reason = ''
         if isinstance(request.data, dict):
@@ -219,8 +203,8 @@ class PackageView(APIView):
                 _tombstone_version(version, reason)
             PackageAlias.objects.filter(package=package).delete()
 
-        if package.package_type.name == 'page':
-            wipe_public(package.name)
+        # Belt-and-braces: ensure no served page survives the takedown.
+        unpublish(package, reason='tombstoned')
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -229,20 +213,15 @@ class PackageView(APIView):
 # /api/packages/<name>/versions
 # ---------------------------------------------------------------------------
 
-class PackageVersionsView(APIView):
+class PackageVersionsView(OrgScopedView):
     """GET — list versions (history). POST — publish a new version."""
 
-    def get_permissions(self):
-        if self.request.method == 'POST':
-            return [IsAuthenticated()]
-        return [AllowAny()]
-
     def get(self, request, name):
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         qs = (
             PackageVersion.objects
             .filter(package=package)
-            .select_related('author', 'package__package_type', 'forked_from__package')
+            .select_related('author', 'forked_from__package')
             .order_by('-version')
         )
         return Response(PackageVersionSerializer(qs, many=True).data)
@@ -278,6 +257,7 @@ class PackageVersionsView(APIView):
         try:
             version = process_upload(
                 upload,
+                organisation=self.org,
                 expected_name=name,
                 summary=summary,
                 description=description,
@@ -295,7 +275,7 @@ class PackageVersionsView(APIView):
 
         version = (
             PackageVersion.objects
-            .select_related('author', 'package__package_type', 'forked_from__package')
+            .select_related('author', 'forked_from__package')
             .get(pk=version.pk)
         )
         return Response(
@@ -308,19 +288,15 @@ class PackageVersionsView(APIView):
 # /api/packages/<name>/versions/<n>
 # ---------------------------------------------------------------------------
 
-class PackageVersionView(APIView):
+class PackageVersionView(OrgScopedView):
     """GET — version metadata. DELETE — tombstone."""
-
-    def get_permissions(self):
-        if self.request.method == 'DELETE':
-            return [IsAuthenticated()]
-        return [AllowAny()]
 
     def get(self, request, name, n):
         version_obj = get_object_or_404(
             PackageVersion.objects.select_related(
-                'author', 'package__package_type', 'forked_from__package',
+                'author', 'forked_from__package',
             ),
+            package__organisation=self.org,
             package__name=name,
             version=n,
         )
@@ -328,7 +304,8 @@ class PackageVersionView(APIView):
 
     def delete(self, request, name, n):
         version_obj = get_object_or_404(
-            PackageVersion.objects.select_related('package__package_type'),
+            PackageVersion.objects.select_related('package'),
+            package__organisation=self.org,
             package__name=name,
             version=n,
         )
@@ -348,7 +325,7 @@ class PackageVersionView(APIView):
 
         version_obj = (
             PackageVersion.objects
-            .select_related('author', 'package__package_type', 'forked_from__package')
+            .select_related('author', 'forked_from__package')
             .get(pk=version_obj.pk)
         )
         return Response(PackageVersionSerializer(version_obj).data)
@@ -358,12 +335,15 @@ class PackageVersionView(APIView):
 # /api/packages/<name>/versions/<n>/download
 # ---------------------------------------------------------------------------
 
-class PackageVersionDownloadView(APIView):
-    permission_classes = [AllowAny]
+class PackageVersionDownloadView(OrgScopedView):
 
     def get(self, request, name, n):
+        # Resolve org from the passed request so this works both via normal
+        # dispatch and when invoked directly by PackageLatestDownloadView.
+        org = resolve_org(request)
         version_obj = get_object_or_404(
-            PackageVersion.objects.select_related('author', 'package__package_type'),
+            PackageVersion.objects.select_related('author'),
+            package__organisation=org,
             package__name=name,
             version=n,
         )
@@ -403,11 +383,10 @@ class PackageVersionDownloadView(APIView):
 # /api/packages/<name>/latest
 # ---------------------------------------------------------------------------
 
-class PackageLatestDownloadView(APIView):
-    permission_classes = [AllowAny]
+class PackageLatestDownloadView(OrgScopedView):
 
     def get(self, request, name):
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         alias = (
             PackageAlias.objects
             .select_related('version')
@@ -428,11 +407,10 @@ class PackageLatestDownloadView(APIView):
 # /api/packages/<name>/history
 # ---------------------------------------------------------------------------
 
-class PackageHistoryView(APIView):
-    permission_classes = [AllowAny]
+class PackageHistoryView(OrgScopedView):
 
     def get(self, request, name):
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         text = render_history(package)
         return HttpResponse(text, content_type='text/markdown; charset=utf-8')
 
@@ -441,16 +419,14 @@ class PackageHistoryView(APIView):
 # /api/packages/<name>/versions/<n>/history
 # ---------------------------------------------------------------------------
 
-class PackageVersionHistoryView(APIView):
+class PackageVersionHistoryView(OrgScopedView):
     """Render HISTORY.md as-of version <n>: this package's versions 1..n
     (newest first) plus the fork chain rooted at version 1. Versions > n
     are not rendered. Tombstoned <n> still renders (with the tombstone
     marker); only an unknown <n> returns 404."""
 
-    permission_classes = [AllowAny]
-
     def get(self, request, name, n):
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         get_object_or_404(PackageVersion, package=package, version=n)
         text = render_history(package, max_version=int(n))
         return HttpResponse(text, content_type='text/markdown; charset=utf-8')
@@ -460,11 +436,10 @@ class PackageVersionHistoryView(APIView):
 # /api/packages/<name>/aliases
 # ---------------------------------------------------------------------------
 
-class PackageAliasesView(APIView):
-    permission_classes = [AllowAny]
+class PackageAliasesView(OrgScopedView):
 
     def get(self, request, name):
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         qs = package.aliases.select_related('version').order_by('name')
         return Response(PackageAliasSerializer(qs, many=True).data)
 
@@ -473,10 +448,8 @@ class PackageAliasesView(APIView):
 # /api/packages/<name>/aliases/<alias>
 # ---------------------------------------------------------------------------
 
-class PackageAliasView(APIView):
+class PackageAliasView(OrgScopedView):
     """PUT — set/move alias to a version. DELETE — remove alias."""
-
-    permission_classes = [IsAuthenticated]
 
     def _validate_alias_name(self, alias: str):
         if alias == _RESERVED_ALIAS:
@@ -526,7 +499,7 @@ class PackageAliasView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         try:
             target = PackageVersion.objects.get(package=package, version=target_n)
         except PackageVersion.DoesNotExist:
@@ -552,7 +525,7 @@ class PackageAliasView(APIView):
         if bad is not None:
             return bad
 
-        package = get_object_or_404(Package, name=name)
+        package = self.get_package(name)
         deleted, _ = PackageAlias.objects.filter(
             package=package, name=alias,
         ).delete()
@@ -562,3 +535,57 @@ class PackageAliasView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# /api/publish/<name>   and   /api/publish/<name>/history
+# ---------------------------------------------------------------------------
+
+def _pub_body(package, pub):
+    return {
+        'package': package.name,
+        'version': pub.version.version,
+        'published_at': pub.at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'url': page_url(package),
+    }
+
+
+class PagePublishView(OrgScopedView):
+    """POST — publish latest version's public/ folder.
+    DELETE — unpublish (remove served files).
+    GET — current published version + timestamp."""
+
+    def post(self, request, name):
+        package = self.get_package(name)
+        try:
+            pub = publish_latest(package, principal_user=request.user)
+        except NoPublicFolderError:
+            return Response(
+                {'detail': 'no public folder in latest version'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        return Response(_pub_body(package, pub))
+
+    def delete(self, request, name):
+        package = self.get_package(name)
+        unpublish(package, principal_user=request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def get(self, request, name):
+        package = self.get_package(name)
+        pub = current_publication(package)
+        if pub is None:
+            return Response(
+                {'detail': 'not currently published'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(_pub_body(package, pub))
+
+
+class PagePublishHistoryView(OrgScopedView):
+    """GET — the full publication log, newest first."""
+
+    def get(self, request, name):
+        package = self.get_package(name)
+        qs = package.page_publications.select_related('version', 'published_by')
+        return Response(PagePublicationSerializer(qs, many=True).data)

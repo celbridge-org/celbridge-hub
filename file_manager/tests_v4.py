@@ -1,22 +1,34 @@
-"""Tests for the v4 package API: REST-shaped endpoints, named aliases,
-page-type rename, server-stamped version, HISTORY.md updates."""
+"""Tests for the package API: REST-shaped endpoints, named aliases,
+server-stamped version, HISTORY.md, fork detection, tombstones.
+
+Updated for v7: every endpoint requires an organisation context (no
+anonymous access), package types are gone, and the author comes from the
+manifest scoped to the caller's org. All test data lives in a single
+shared org so cross-package behaviour (forks, listing) works; cross-org
+isolation is covered in `tests_org_isolation.py`.
+"""
 from __future__ import annotations
 
 import hashlib
 import io
 import json
-import os
 import tomllib
 import zipfile
 
-from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from .history import render_history
-from .models import Author, Package, PackageAlias, PackageType, PackageVersion
+from .models import (
+    Author,
+    Membership,
+    Organisation,
+    Package,
+    PackageAlias,
+    PackageVersion,
+)
 from .package_parsing import (
     PackageValidationError,
     parse_package_zip,
@@ -39,13 +51,33 @@ def make_zip(files: dict) -> bytes:
 
 
 def package_toml(name='demo', type_='mod', author='alice', extras: str = '') -> str:
+    # `type` is silently ignored in v7; keeping it proves backward-compat.
+    type_line = f'type = "{type_}"\n' if type_ else ''
     return (
         f'[package]\n'
         f'name = "{name}"\n'
-        f'type = "{type_}"\n'
+        f'{type_line}'
         f'author = "{author}"\n'
         f'{extras}'
     )
+
+
+def get_default_org() -> Organisation:
+    org, _ = Organisation.objects.get_or_create(
+        slug='test-org', defaults={'name': 'Test Org'},
+    )
+    return org
+
+
+def auth_client(org: Organisation | None = None) -> APIClient:
+    """An APIClient authenticated as a fresh user who is a member of the
+    given org (the shared default org if none supplied)."""
+    org = org or get_default_org()
+    user = User.objects.create_user(username=f'u{User.objects.count()}', password='p')
+    Membership.objects.create(user=user, organisation=org)
+    c = APIClient()
+    c.force_authenticate(user=user)
+    return c
 
 
 def publish(
@@ -106,17 +138,8 @@ def v4_history(name: str, latest_version: int) -> str:
     return '\n'.join(parts)
 
 
-def auth_client():
-    user = User.objects.create_user(
-        username=f'u{User.objects.count()}', password='p',
-    )
-    c = APIClient()
-    c.force_authenticate(user=user)
-    return c
-
-
 # ---------------------------------------------------------------------------
-# Manifest parsing (v4 vocabulary)
+# Manifest parsing
 # ---------------------------------------------------------------------------
 
 class PackageTomlParseTests(TestCase):
@@ -131,19 +154,22 @@ class PackageTomlParseTests(TestCase):
             "invalid package - missing `package.toml` file",
         )
 
-    def test_missing_type_rejected(self):
+    def test_missing_name_rejected(self):
         with self.assertRaises(PackageValidationError) as ctx:
-            self._parse({'package.toml': '[package]\nname = "x"\nauthor = "a"\n'})
-        self.assertIn('missing', str(ctx.exception))
+            self._parse({'package.toml': '[package]\nauthor = "a"\n'})
+        self.assertIn('name', str(ctx.exception))
 
-    def test_invalid_type_lists_v4_vocabulary(self):
+    def test_missing_author_rejected(self):
         with self.assertRaises(PackageValidationError) as ctx:
-            self._parse({'package.toml': package_toml(type_='library')})
-        self.assertIn('"mod", "project", or "page"', str(ctx.exception))
+            self._parse({'package.toml': '[package]\nname = "x"\n'})
+        self.assertIn('author', str(ctx.exception))
 
-    def test_app_type_no_longer_accepted(self):
-        with self.assertRaises(PackageValidationError):
-            self._parse({'package.toml': package_toml(type_='app')})
+    def test_type_is_optional_and_ignored(self):
+        # v7: a manifest without a type parses fine.
+        parsed = self._parse({'package.toml': package_toml(type_=None)})
+        self.assertEqual(parsed.name, 'demo')
+        self.assertEqual(parsed.author, 'alice')
+        self.assertFalse(hasattr(parsed, 'type'))
 
     def test_top_history_header_parser_v4_format(self):
         text = v4_history('foo', 7)
@@ -168,19 +194,19 @@ class RegisterAndListTests(TestCase):
     def test_register_creates_empty_package(self):
         resp = self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'empty-pkg', 'type': 'mod'}),
+            data=json.dumps({'name': 'empty-pkg'}),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertEqual(resp.data['name'], 'empty-pkg')
-        self.assertEqual(resp.data['type'], 'mod')
+        self.assertNotIn('type', resp.data)
         self.assertEqual(resp.data['versions'], [])
         self.assertEqual(resp.data['aliases'], [])
 
     def test_register_requires_auth(self):
         resp = APIClient().post(
             '/api/packages',
-            data=json.dumps({'name': 'x', 'type': 'mod'}),
+            data=json.dumps({'name': 'x'}),
             content_type='application/json',
         )
         self.assertIn(resp.status_code, (401, 403))
@@ -188,7 +214,7 @@ class RegisterAndListTests(TestCase):
     def test_register_rejects_unknown_field(self):
         resp = self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'x', 'type': 'mod', 'version': 1}),
+            data=json.dumps({'name': 'x', 'bogus': 1}),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 400)
@@ -197,28 +223,24 @@ class RegisterAndListTests(TestCase):
     def test_register_rejects_duplicate(self):
         self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'x', 'type': 'mod'}),
+            data=json.dumps({'name': 'x'}),
             content_type='application/json',
         )
         resp = self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'x', 'type': 'page'}),
+            data=json.dumps({'name': 'x'}),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 409)
 
-    def test_register_rejects_invalid_type(self):
-        resp = self.client.post(
-            '/api/packages',
-            data=json.dumps({'name': 'x', 'type': 'app'}),
-            content_type='application/json',
-        )
-        self.assertEqual(resp.status_code, 400)
+    def test_list_requires_auth(self):
+        resp = APIClient().get('/api/packages')
+        self.assertIn(resp.status_code, (401, 403))
 
-    def test_list_anonymous(self):
+    def test_list_returns_org_packages(self):
         publish(self.client, 'a', {'package.toml': package_toml(name='a')})
         publish(self.client, 'b', {'package.toml': package_toml(name='b')})
-        resp = APIClient().get('/api/packages')
+        resp = self.client.get('/api/packages')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(sorted(p['name'] for p in resp.data), ['a', 'b'])
 
@@ -244,7 +266,14 @@ class PublishTests(TestCase):
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertEqual(resp.data['version'], 1)
         self.assertEqual(resp.data['package'], 'demo')
+        self.assertEqual(resp.data['author'], 'alice')
         self.assertTrue(resp.data['content_hash'].startswith('sha256:'))
+
+    def test_author_comes_from_manifest(self):
+        publish(self.client, 'demo', {'package.toml': package_toml(name='demo', author='bob')})
+        v = PackageVersion.objects.get(package__name='demo', version=1)
+        self.assertEqual(v.author.name, 'bob')
+        self.assertEqual(v.author.organisation, get_default_org())
 
     def test_publish_increments_version(self):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
@@ -262,20 +291,6 @@ class PublishTests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn('does not match', resp.data['detail'])
 
-    def test_publish_to_registered_type_must_match(self):
-        # Pre-register as mod, then attempt to publish a page manifest.
-        self.client.post(
-            '/api/packages',
-            data=json.dumps({'name': 'demo', 'type': 'mod'}),
-            content_type='application/json',
-        )
-        resp = publish(
-            self.client, 'demo',
-            {'package.toml': package_toml(name='demo', type_='page')},
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn('package type mismatch', resp.data['detail'])
-
     def test_parent_version_check_passes_when_matched(self):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         resp = publish(
@@ -289,7 +304,6 @@ class PublishTests(TestCase):
     def test_parent_version_check_fails_when_stale(self):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
-        # head is now 2; client thinks it's still 1
         resp = publish(
             self.client, 'demo',
             {'package.toml': package_toml(name='demo')},
@@ -316,38 +330,6 @@ class PublishTests(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Page-type extraction (renamed from app)
-# ---------------------------------------------------------------------------
-
-class PageTypeTests(TestCase):
-    def setUp(self):
-        self.client = auth_client()
-
-    def test_page_extracts_to_public(self):
-        resp = publish(
-            self.client, 'site',
-            {
-                'package.toml': package_toml(name='site', type_='page'),
-                'index.html': b'<h1>hi</h1>',
-            },
-        )
-        self.assertEqual(resp.status_code, 201, resp.data)
-        self.assertEqual(resp.data['public_url'], '/public/site/')
-        self.assertTrue(
-            os.path.isdir(os.path.join(settings.PUBLIC_ROOT, 'site'))
-        )
-
-    def test_mod_does_not_extract(self):
-        publish(
-            self.client, 'lib',
-            {'package.toml': package_toml(name='lib', type_='mod')},
-        )
-        self.assertFalse(
-            os.path.isdir(os.path.join(settings.PUBLIC_ROOT, 'lib'))
-        )
-
-
-# ---------------------------------------------------------------------------
 # Server-stamped version
 # ---------------------------------------------------------------------------
 
@@ -367,11 +349,9 @@ class StampedVersionTests(TestCase):
         self.assertEqual(toml_data['package']['version'], 1)
 
     def test_version_stamped_replaces_stale(self):
-        # User left stale `version = 99` in their manifest.
         toml = (
             '[package]\n'
             'name = "demo"\n'
-            'type = "mod"\n'
             'author = "a"\n'
             'version = 99\n'
         )
@@ -398,7 +378,7 @@ class AliasTests(TestCase):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
 
     def test_latest_auto_set_on_publish(self):
-        resp = APIClient().get('/api/packages/demo/aliases')
+        resp = self.client.get('/api/packages/demo/aliases')
         self.assertEqual(resp.status_code, 200)
         latest = next(a for a in resp.data if a['name'] == 'latest')
         self.assertEqual(latest['version'], 3)
@@ -488,7 +468,6 @@ class AliasTests(TestCase):
         )
 
     def test_latest_moves_on_tombstone_of_head(self):
-        # head is currently v3; tombstoning it should move latest to v2.
         self.client.delete('/api/packages/demo/versions/3')
         latest = PackageAlias.objects.get(package__name='demo', name='latest')
         self.assertEqual(latest.version.version, 2)
@@ -500,13 +479,13 @@ class AliasTests(TestCase):
             PackageAlias.objects.filter(package__name='demo', name='latest').exists()
         )
 
-    def test_alias_list_anonymous(self):
+    def test_alias_list(self):
         self.client.put(
             '/api/packages/demo/aliases/stable',
             data=json.dumps({'version': 2}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/demo/aliases')
+        resp = self.client.get('/api/packages/demo/aliases')
         self.assertEqual(resp.status_code, 200)
         names = sorted(a['name'] for a in resp.data)
         self.assertEqual(names, ['latest', 'stable'])
@@ -533,9 +512,8 @@ class LatestShortcutTests(TestCase):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
 
-        anon = APIClient()
-        resp_direct = anon.get('/api/packages/demo/versions/2/download')
-        resp_latest = anon.get('/api/packages/demo/latest')
+        resp_direct = self.client.get('/api/packages/demo/versions/2/download')
+        resp_latest = self.client.get('/api/packages/demo/latest')
 
         self.assertEqual(resp_direct.status_code, 200)
         self.assertEqual(resp_latest.status_code, 200)
@@ -547,10 +525,10 @@ class LatestShortcutTests(TestCase):
     def test_latest_404_when_no_published_versions(self):
         self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'empty', 'type': 'mod'}),
+            data=json.dumps({'name': 'empty'}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/empty/latest')
+        resp = self.client.get('/api/packages/empty/latest')
         self.assertEqual(resp.status_code, 404)
 
 
@@ -569,7 +547,7 @@ class TombstoneTests(TestCase):
             data=json.dumps({'reason': 'oops'}),
             content_type='application/json',
         )
-        resp = APIClient().get('/api/packages/demo/versions/1/download')
+        resp = self.client.get('/api/packages/demo/versions/1/download')
         self.assertEqual(resp.status_code, 410)
         self.assertEqual(resp.data['tombstone_reason'], 'oops')
 
@@ -594,20 +572,6 @@ class TombstoneTests(TestCase):
             PackageAlias.objects.filter(package__name='demo').exists()
         )
 
-    def test_whole_package_delete_wipes_public_for_page(self):
-        publish(
-            self.client, 'site',
-            {
-                'package.toml': package_toml(name='site', type_='page'),
-                'index.html': b'<h1>hi</h1>',
-            },
-        )
-        public_dir = os.path.join(settings.PUBLIC_ROOT, 'site')
-        self.assertTrue(os.path.isdir(public_dir))
-
-        self.client.delete('/api/packages/site')
-        self.assertFalse(os.path.isdir(public_dir))
-
     def test_whole_package_delete_preserves_name(self):
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         self.client.delete('/api/packages/demo')
@@ -615,14 +579,14 @@ class TombstoneTests(TestCase):
         # Re-registering same name must 409 (Package row preserved).
         resp = self.client.post(
             '/api/packages',
-            data=json.dumps({'name': 'demo', 'type': 'mod'}),
+            data=json.dumps({'name': 'demo'}),
             content_type='application/json',
         )
         self.assertEqual(resp.status_code, 409)
 
 
 # ---------------------------------------------------------------------------
-# Fork detection (carried from v3, retested against v4 format)
+# Fork detection
 # ---------------------------------------------------------------------------
 
 class ForkDetectionTests(TestCase):
@@ -680,9 +644,6 @@ class HistoryRenderTests(TestCase):
         self.assertIn('> Authoritative copy lives on the server', text)
 
     def test_aliases_section_omitted(self):
-        # HISTORY.md is a snapshot at publish time and is never regenerated,
-        # so mutable alias state is intentionally excluded — clients should
-        # query /api/packages/{name}/aliases for current alias mappings.
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo')})
         self.client.put(
             '/api/packages/demo/aliases/stable',
@@ -713,27 +674,39 @@ class ReadAPITests(TestCase):
         self.client = auth_client()
         publish(self.client, 'demo', {'package.toml': package_toml(name='demo', author='alice')}, summary='one')
 
+    def test_reads_require_auth(self):
+        for path in (
+            '/api/packages/demo',
+            '/api/packages/demo/versions',
+            '/api/packages/demo/versions/1',
+            '/api/packages/demo/versions/1/download',
+            '/api/packages/demo/history',
+        ):
+            resp = APIClient().get(path)
+            self.assertIn(resp.status_code, (401, 403), msg=path)
+
     def test_detail_includes_aliases(self):
-        resp = APIClient().get('/api/packages/demo')
+        resp = self.client.get('/api/packages/demo')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['name'], 'demo')
+        self.assertNotIn('type', resp.data)
         names = [a['name'] for a in resp.data['aliases']]
         self.assertIn('latest', names)
 
     def test_versions_list(self):
-        resp = APIClient().get('/api/packages/demo/versions')
+        resp = self.client.get('/api/packages/demo/versions')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.data), 1)
         self.assertEqual(resp.data[0]['version'], 1)
 
     def test_version_metadata(self):
-        resp = APIClient().get('/api/packages/demo/versions/1')
+        resp = self.client.get('/api/packages/demo/versions/1')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['version'], 1)
         self.assertTrue(resp.data['content_hash'].startswith('sha256:'))
 
     def test_download_zip(self):
-        resp = APIClient().get('/api/packages/demo/versions/1/download')
+        resp = self.client.get('/api/packages/demo/versions/1/download')
         self.assertEqual(resp.status_code, 200)
         body = b''.join(resp.streaming_content)
         with zipfile.ZipFile(io.BytesIO(body), 'r') as zf:
@@ -741,7 +714,7 @@ class ReadAPITests(TestCase):
         self.assertIn('# Package History: demo', history)
 
     def test_history_endpoint_text_markdown(self):
-        resp = APIClient().get('/api/packages/demo/history')
+        resp = self.client.get('/api/packages/demo/history')
         self.assertEqual(resp.status_code, 200)
         self.assertIn('text/markdown', resp['Content-Type'])
         self.assertIn(b'# Package History: demo', resp.content)
@@ -758,23 +731,23 @@ class ContentHashTests(TestCase):
         publish(client, 'demo', {'package.toml': package_toml(name='demo')})
         v1 = PackageVersion.objects.get(package__name='demo', version=1)
 
-        resp = APIClient().get('/api/packages/demo/versions/1/download')
+        resp = client.get('/api/packages/demo/versions/1/download')
         body = b''.join(resp.streaming_content)
         expected = 'sha256:' + hashlib.sha256(body).hexdigest()
         self.assertEqual(v1.content_hash, expected)
 
 
 # ---------------------------------------------------------------------------
-# Concurrency / unique constraint
+# Unique constraint
 # ---------------------------------------------------------------------------
 
 class VersionConstraintTests(TestCase):
     def test_unique_together_blocks_duplicate_version(self):
         from django.core.files.base import ContentFile
 
-        author = Author.objects.create(name='matt')
-        pkg_type = PackageType.objects.get(name='mod')
-        package = Package.objects.create(name='same', package_type=pkg_type)
+        org = get_default_org()
+        author = Author.objects.create(name='matt', organisation=org)
+        package = Package.objects.create(name='same', organisation=org)
         PackageVersion.objects.create(
             package=package, version=1, author=author,
             zip_file=ContentFile(b'x', name='v1.zip'),

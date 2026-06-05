@@ -1,27 +1,26 @@
-"""End-to-end upload pipeline for v4 packages.
+"""End-to-end upload pipeline for v7 packages.
 
 Takes a Django UploadedFile (a ZIP), validates `package.toml`, persists
 the new `PackageVersion` (creating `Package` and/or `Author` rows as
-needed), regenerates `HISTORY.md` from the DB, stamps the assigned
-version into the embedded `package.toml`, repackages the ZIP, upserts
-the `latest` alias, and — for `page`-type packages — extracts the
-latest version into `/public/<name>/`.
+needed, scoped to the caller's organisation), regenerates `HISTORY.md`
+from the DB, stamps the assigned version into the embedded
+`package.toml`, repackages the ZIP, and upserts the `latest` alias.
+
+Publishing of a package's `public/` folder is a separate, explicit
+action handled by `pages.py` — uploads no longer publish anything.
 """
 from __future__ import annotations
 
 import hashlib
 import io
-import os
 import re
-import shutil
 import zipfile
 
-from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db import transaction
 
 from .history import render_history
-from .models import Author, Package, PackageAlias, PackageType, PackageVersion
+from .models import Author, Package, PackageAlias, PackageVersion
 from .package_parsing import (
     PackageValidationError,
     ParsedPackage,
@@ -50,10 +49,6 @@ class HeadMismatchError(PackagePipelineError):
     def __init__(self, current_head: int):
         super().__init__('head moved')
         self.extra = {'head': current_head}
-
-
-class TypeConflictError(PackagePipelineError):
-    http_status = 400
 
 
 def _read_uploaded_bytes(django_file) -> bytes:
@@ -159,12 +154,14 @@ def _repackage_zip(
     return out_buf.getvalue()
 
 
-def _detect_fork(parsed: ParsedPackage) -> PackageVersion | None:
+def _detect_fork(parsed: ParsedPackage, organisation) -> PackageVersion | None:
     """Return an ancestor `PackageVersion` if the upload is a valid fork.
 
     Only called for new package names. Returns None if no embedded
     history, or if the embedded header references a package/version that
-    doesn't exist in the DB, or if it self-references.
+    doesn't exist in the caller's organisation, or if it self-references.
+    Fork lineage is scoped to the organisation — you cannot fork from
+    another org's package.
     """
     if not parsed.history_md:
         return None
@@ -178,33 +175,14 @@ def _detect_fork(parsed: ParsedPackage) -> PackageVersion | None:
         return (
             PackageVersion.objects
             .select_related('package')
-            .get(package__name=ancestor_name, version=ancestor_version)
+            .get(
+                package__organisation=organisation,
+                package__name=ancestor_name,
+                version=ancestor_version,
+            )
         )
     except PackageVersion.DoesNotExist:
         return None
-
-
-def _extract_to_public(zip_bytes: bytes, package_name: str) -> str:
-    """Wipe and rewrite `/public/<name>/` from the given ZIP bytes."""
-    dest_dir = os.path.join(settings.PUBLIC_ROOT, package_name)
-    if os.path.exists(dest_dir):
-        shutil.rmtree(dest_dir)
-    os.makedirs(dest_dir, exist_ok=True)
-
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-        for member in zf.infolist():
-            member_path = os.path.normpath(member.filename)
-            if member_path.startswith('..') or os.path.isabs(member_path):
-                continue
-            zf.extract(member, dest_dir)
-
-    return f'/public/{package_name}/'
-
-
-def wipe_public(package_name: str) -> None:
-    dest_dir = os.path.join(settings.PUBLIC_ROOT, package_name)
-    if os.path.exists(dest_dir):
-        shutil.rmtree(dest_dir)
 
 
 def _read_original_toml(zip_bytes: bytes) -> tuple[str, str]:
@@ -223,6 +201,7 @@ def _read_original_toml(zip_bytes: bytes) -> tuple[str, str]:
 def process_upload(
     django_file,
     *,
+    organisation,
     expected_name: str | None = None,
     summary: str = '',
     description: str = '',
@@ -248,33 +227,20 @@ def process_upload(
             f"manifest name '{parsed.name}' does not match URL '{expected_name}'"
         )
 
-    try:
-        package_type = PackageType.objects.get(name=parsed.type)
-    except PackageType.DoesNotExist as exc:
-        raise PackagePipelineError(
-            f"package type '{parsed.type}' is not configured"
-        ) from exc
-
-    author, _ = Author.objects.get_or_create(name=parsed.author)
+    author, _ = Author.objects.get_or_create(
+        organisation=organisation, name=parsed.author,
+    )
 
     with transaction.atomic():
         existing = (
             Package.objects
             .select_for_update()
-            .filter(name=parsed.name)
+            .filter(organisation=organisation, name=parsed.name)
             .first()
         )
 
         if existing is not None:
-            # New version of an existing package. Type is fixed at creation
-            # — reject if the manifest disagrees.
-            if existing.package_type.name != parsed.type:
-                raise TypeConflictError(
-                    f"package type mismatch — registered as "
-                    f"'{existing.package_type.name}', manifest declares "
-                    f"'{parsed.type}'"
-                )
-
+            # New version of an existing package.
             latest = (
                 PackageVersion.objects
                 .filter(package=existing)
@@ -293,11 +259,11 @@ def process_upload(
             if parent_version is not None and parent_version != 0:
                 raise HeadMismatchError(0)
             package = Package.objects.create(
+                organisation=organisation,
                 name=parsed.name,
-                package_type=package_type,
             )
             next_version = 1
-            forked_from = _detect_fork(parsed)
+            forked_from = _detect_fork(parsed, organisation)
 
         # Stamp version into the manifest BEFORE rendering HISTORY.md
         # (HISTORY.md doesn't reference the manifest, but order is clean).
@@ -332,8 +298,5 @@ def process_upload(
             ContentFile(repacked),
             save=True,
         )
-
-    if package.package_type.name == 'page':
-        _extract_to_public(repacked, package.name)
 
     return version

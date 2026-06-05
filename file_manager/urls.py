@@ -11,6 +11,8 @@ from .views import (
     PackageVersionView,
     PackageVersionsView,
     PackageView,
+    PagePublishHistoryView,
+    PagePublishView,
 )
 
 
@@ -63,5 +65,15 @@ urlpatterns = [
         rf'^packages/{NAME}/aliases/{ALIAS}/?$',
         PackageAliasView.as_view(),
         name='package-alias',
+    ),
+    re_path(
+        rf'^publish/{NAME}/history/?$',
+        PagePublishHistoryView.as_view(),
+        name='page-publish-history',
+    ),
+    re_path(
+        rf'^publish/{NAME}/?$',
+        PagePublishView.as_view(),
+        name='page-publish',
     ),
 ]
