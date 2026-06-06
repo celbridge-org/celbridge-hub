@@ -166,6 +166,94 @@ plain HTTP is also reachable by default — so close that hole:
 plaintext — which is why `bootstrap_org` / `issue_api_key` show it once.)
 
 
+# (1c) Upgrading a v7 deployment to v8 (ADDITIVE — no data reset)
+
+**v8 decouples `pages` from packages.** Unlike the v6→v7 jump, v8 is an
+*ordinary additive* migration: it adds one migration (`0002`) on top of
+v7's `0001_initial` and does **not** touch the package schema or any
+existing migration file. So there is **no clean start** here — your
+packages, versions, authors, aliases, API keys, superuser and database
+all stay. Use the additive (1b) path, with one extra step.
+
+> Why not (1a)? v8 ships a new migration, so a plain pull + reload would
+> leave the schema behind the code. You must `migrate`.
+>
+> Why not the v6→v7 clean-start? That existed only because v7 *deleted
+> and regenerated* migrations `0001`–`0007`, breaking the recorded
+> history. v8 changes neither the package schema nor old migrations.
+
+### What changes for clients
+
+- The v7 package-publish endpoints are **gone**:
+  `POST/DELETE/GET /api/publish/<name>` and `/history`, and the
+  `public/` subfolder convention.
+- Pages are now a standalone ZIP upload: `POST /api/pages` (multipart
+  `file=@bundle.zip`), where the ZIP contains a top-level `pages.toml`
+  with `[publish].path = "dev/chess24"`. Served at
+  `/pages/<org-slug>/<path>/`. Manage by path:
+  `GET`/`DELETE /api/pages/<path>`, list with `GET /api/pages`.
+- `settings.py` is **unchanged** by v8 (`PAGES_ROOT`/`PAGES_URL` and the
+  auth/permission classes are all as they were in v7), so — unlike the
+  v6→v7 note — a plain `git stash apply` of your host-specific
+  `ALLOWED_HOSTS` line is safe this time.
+
+### Steps
+
+```bash
+workon myenv
+cd ~/django-file_upload_API
+git stash                 # your local settings.py / .env tweaks
+git pull
+git stash apply           # safe: v8 did not change settings.py
+```
+
+**Before migrating, clear the old pages audit log.** The `0002`
+migration adds non-null `organisation` + `path` columns to
+`PagePublication`. Any leftover v7 publication rows would be rewritten
+into meaningless audit rows (org 1, empty path) — and if no
+`Organisation` with **pk=1** exists, the migration can even *fail* on the
+foreign-key check. Clearing the table sidesteps both. This is a no-op if
+you never used the v7 `/api/publish/<name>` feature on this server, and
+it matches v8's "clean break for the pages subsystem only" design (that
+log has no API surface anyway):
+
+```bash
+python manage.py shell -c "from file_manager.models import PagePublication; print(PagePublication.objects.all().delete())"
+```
+
+Then migrate and reload:
+
+```bash
+python manage.py migrate
+# collectstatic NOT needed — v8 changed no static files
+```
+
+  - Reload the web app (green **Reload** button on the Web tab).
+
+### Optional cleanup of stale v7 page output
+
+v7 served pages under `media/pages/<org-slug>/<package-name>/`; v8 serves
+under `media/pages/<org-slug>/<path>/` (path from `pages.toml`). Old v7
+output is now orphaned — harmless, but you can remove it. Inspect first,
+then delete the package-name-based dirs you recognise:
+
+```bash
+ls media/pages/*/          # review what is there before deleting anything
+# rm -rf media/pages/<org-slug>/<old-package-name>
+```
+
+### Verify
+
+```bash
+curl -H "Authorization: Api-Key <key>" \
+     https://drmattsmith.pythonanywhere.com/api/pages
+# → []   (empty list = working; no pages published under the new feature yet)
+```
+
+Your existing API keys keep working — no need to re-`bootstrap_org` or
+re-issue keys.
+
+
 # (2) If for a NEW installation
 
 ## open a new Bash console
